@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  台電今日用電曲線中繼爬蟲（launchd）
+
+  ★ 每小時跑一次就夠：CSV 是「當日累積」的完整檔，一次抓就拿到全部
+    144 個 10 分鐘點。不需要每 10 分鐘跑，那只是重複下載同一份檔。
+  ★ 用定時啟動短命程序，不要常駐——macOS 的 App Nap 會把長時間背景
+    程序降頻，短命程序不受影響。
+
+  安裝前把 /PATH/TO 換成實際路徑。
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>tw.nics.taipower-curve</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/PATH/TO/monitor_taipower_curve/venv/bin/python</string>
+    <string>scripts/run_once.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/PATH/TO/monitor_taipower_curve</string>
+
+  <!-- 每 3600 秒。★ 開機／喚醒後會補跑一次，但睡 8 小時只補 1 次不補 8 次 -->
+  <key>StartInterval</key>
+  <integer>3600</integer>
+
+  <!-- 載入時先跑一次，不用等第一個小時 -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/taipower-curve.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/taipower-curve.log</string>
+</dict>
+</plist>

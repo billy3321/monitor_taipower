@@ -1,0 +1,33 @@
+# 複製為 config/config.yml 後填入實際密碼。config.yml 不進 git。
+environment: production
+
+database:
+  production:
+    driver: "postgresql"
+    # ★ Cloud SQL 的**公開 IP**（Mac 不在 VPC 內，走不了 10.x 私有 IP）
+    host: "35.221.64.187"
+    port: 5432
+    user: "crawler"
+    password: "CHANGE_ME"
+    # ★ 這張表在 dashboard 的 monitor 庫，不是爬蟲庫
+    database: "dashboard_monitor"
+    ssl_enabled: true
+    ssl_mode: "require"
+    ssl_ca_path: "config/ssl/server-ca.pem"
+    ssl_cert_path: "config/ssl/client-cert.pem"
+    ssl_key_path: "config/ssl/client-key.pem"
+    echo: false
+
+# 抓網頁本來就會抓的 CSV → 用瀏覽器 UA
+crawler:
+  user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+  fetch_delay: 1.0        # 每次請求之間的間隔秒數（爬取自律）
+
+# 遙測（家族契約 Telemetry Standard v2）
+# ★ Mac 不在 VPC 內，10.146.0.18 這個私有 IP **連不到**。
+#   請填 Pushgateway 的對外位址；若暫時沒有，設 enabled: false，
+#   但要知道那代表這支爬蟲的存活狀態沒有人在看。
+monitoring:
+  pushgateway:
+    enabled: false
+    url: "http://CHANGE_ME:29095"
