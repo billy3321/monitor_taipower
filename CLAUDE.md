@@ -167,6 +167,44 @@ python3 scripts/verify_fixtures.py   # 欄位對應驗收，零相依，直接�
 ★ 存活告警是 `time() - scrapy_last_success_timestamp_seconds > 門檻`，
 **不可用 `up`**（Pushgateway 的 up 永遠是 1）。
 
+### ★★ 一定要用 `pushadd_to_gateway`，不可用 `push_to_gateway`
+
+`push_to_gateway()` 是 **HTTP PUT ＝ 整組取代**。而契約是
+「`scrapy_last_success_timestamp_seconds` 僅在成功時設」——所以**失敗那次**
+推上去的那組裡沒有它，PUT 會把**前一次成功的時間戳一併洗掉**。
+序列不存在時，`time() - scrapy_last_success_timestamp_seconds > 門檻`
+是對空向量求值，**永遠不會燒**。
+
+也就是說：**爬蟲失敗這件事本身，會讓偵測它失敗的告警消失。**
+
+不是理論——2026-08-05 家族的 `adsb` 從 15:00 起每小時失敗，Pushgateway 上
+只剩 `last_run` 與 `log_errors=1`，`last_success` 整個不見，兩小時內沒有任何
+告警，是人工查資料庫才發現的。
+
+`pushadd_to_gateway()`（POST）只新增／更新這次推的指標，不動其他的。
+代價是「某次推了之後再也不推的指標會留著舊值」，**這是刻意接受的取捨**：
+留一個過期的值，遠好過整組告警靜默失效。
+
+★ 這支換機器或退役時，**一定要刪掉舊的 grouping key**，否則會留下永遠不更新的
+`last_success`，過了門檻時間後永久誤報且怎麼修都不會好：
+
+```bash
+curl -X DELETE "http://<pushgateway>/metrics/job/monitor_taipower_curve/instance_id/<舊的>/spider/loadcurve"
+```
+
+## ★ 排程要對齊時鐘，不可用 StartInterval
+
+檔案在 **00:00 換日重置**，當日最後那幾個時間點過了午夜就**永久取不回來**
+（那份來源沒有歷史）。而台電的發布延遲是 **7–11 分鐘**（2026-08-05 實測）。
+
+`StartInterval` 的執行時刻由「載入當下」決定並會漂移：實測載入後變成每小時的
+`:21` 跑，當天最後一次 23:21 只抓到 23:10，**23:20/23:30/23:40/23:50 四個點
+每天固定遺失**（每天 64 列）。而且這種缺口在圖上看不出來——它長得就像
+「那時候沒用電」。
+
+所以用 `StartCalendarInterval` 對齊時鐘：每小時 `:55`，再加一次 `23:59` 收尾。
+請求量幾乎不變（25 次/日 vs 24 次/日）。見 `deployment/*.plist`。
+
 ## 資料表
 
 **不要自己建表、不要自己寫 migration。** 表由 dashboard-app 的 `alembic_monitor`

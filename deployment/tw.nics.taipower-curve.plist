@@ -7,6 +7,14 @@
   ★ 用定時啟動短命程序，不要常駐——macOS 的 App Nap 會把長時間背景
     程序降頻，短命程序不受影響。
 
+  ★★ 用 StartCalendarInterval 而不是 StartInterval，理由是**午夜缺口**：
+     檔案在 00:00 換日重置，當日最後那幾個時間點過了午夜就永久取不回來
+     （那份來源沒有歷史）。StartInterval 的執行時刻由「載入當下」決定並
+     會漂移——2026-08-05 實測是每小時的 :21 跑，而台電發布延遲 7–11 分鐘，
+     於是當天最後一次 23:21 只抓到 23:10，23:20/23:30/23:40/23:50
+     四個點每天固定遺失。改成對齊時鐘的 :55 再加一次 23:59 收尾，
+     請求量幾乎不變（25 次/日 vs 24 次/日）而缺口補上。
+
   安裝前把 /PATH/TO 換成實際路徑。
 -->
 <plist version="1.0">
@@ -23,11 +31,23 @@
   <key>WorkingDirectory</key>
   <string>/PATH/TO/monitor_taipower_curve</string>
 
-  <!-- 每 3600 秒。★ 開機／喚醒後會補跑一次，但睡 8 小時只補 1 次不補 8 次 -->
-  <key>StartInterval</key>
-  <integer>3600</integer>
+  <!-- 每小時的 :55 各一次，再加 23:59 收當日尾巴。
+       ★ 睡眠中錯過的排程，喚醒後 launchd 只補跑一次，不會補足每一次。 -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict>
+      <key>Minute</key>
+      <integer>55</integer>
+    </dict>
+    <dict>
+      <key>Hour</key>
+      <integer>23</integer>
+      <key>Minute</key>
+      <integer>59</integer>
+    </dict>
+  </array>
 
-  <!-- 載入時先跑一次，不用等第一個小時 -->
+  <!-- 開機／載入後先跑一次，不用等下一個 :55 -->
   <key>RunAtLoad</key>
   <true/>
 
