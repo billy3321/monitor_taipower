@@ -110,9 +110,42 @@ python3 scripts/verify_fixtures.py   # 欄位對應驗收，零相依，直接�
   而且畫面看起來完全正常，可能好幾天沒人發現。
 - 每次執行都要推遙測（見下），失敗也要推。沒有遙測 = 爬蟲死了沒人知道。
 
-### 抓網頁的 UA 用瀏覽器 UA
-這是抓網頁本來就會抓的 CSV，用瀏覽器 UA。
-（家族裡只有 SANS ISC 那種明文要求聯絡信箱的來源才用自訂 UA。）
+### HTTP 用函式庫，標頭要與真實瀏覽器一致
+
+- **用 `requests`（或 httpx），不要 shell out 去呼叫 curl。** curl 沒有錯誤型別、
+  沒有連線重用、逾時與重試都要自己拼字串，而且 subprocess 的失敗很難分類。
+  `preflight.py` 已經示範了要的形狀：Session + 自訂 Adapter。
+
+- **標頭要送完整的一組**，不是只有 UA。理由不是「騙過誰」，而是
+  **讓我們的請求跟那個頁面自己發的請求長得一樣**——WAF 常對
+  「只有 UA、沒有 Accept/Accept-Language/Referer」的請求提高警覺，
+  那種請求在真實瀏覽器裡根本不存在。建議這一組：
+
+  ```python
+  {
+      'User-Agent': <config 的 crawler.user_agent>,
+      'Accept': 'text/csv,text/plain,*/*',
+      'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.8',
+      'Referer': 'https://www.taipower.com.tw/2289/2363/2367/2368/10264/normalPost',
+      'Sec-Fetch-Dest': 'empty',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'same-origin',
+  }
+  ```
+
+  Referer 用那個頁面本來就會載入這支 CSV 的網址（能源別是 10264、
+  區域別是 10263），不要亂填。
+
+- ★ **但不要往「規避封鎖」的方向做**。實測結論已經很清楚：CloudFront 擋的是
+  IP／ASN，補標頭、換 HTTP/2 在被擋的機器上**一點用都沒有**（三台 GCP
+  全試過）。在允許的網路上，標頭只是讓請求正常；在被擋的網路上，
+  再怎麼調標頭都沒用，也不該去試。抓不到就讓它失敗、讓告警響。
+
+- 保留既有的 `RelaxedGovTwAdapter`：台灣政府 PKI 缺 Subject Key Identifier，
+  Python 3.13 預設會拒絕。**絕不可改成 `verify=False`。**
+
+- UA 字串從 `config.yml` 的 `crawler.user_agent` 讀，不要寫死在程式裡
+  （家族慣例，方便 Chrome 版本老舊時統一調整）。
 
 ### 爬取自律
 每次執行只打 3 個請求、每小時一次。不要加重試風暴。

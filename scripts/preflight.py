@@ -44,10 +44,26 @@ class RelaxedGovTwAdapter(HTTPAdapter):
             num_pools=connections, maxsize=maxsize, block=block, **kw)
 
 
+# ★ 完整的一組標頭，不是只有 UA。目的不是騙過誰，是**讓請求跟那個頁面
+#   自己發的請求長得一樣**——只帶 UA 的請求在真實瀏覽器裡不存在，
+#   WAF 對那種請求常會提高警覺。Referer 用該頁本來就會載入這支 CSV 的網址。
+# ★ 但這對「被 CloudFront 依 IP 封鎖」完全無效（三台 GCP 全試過）。
+#   標頭只讓請求正常，不是用來規避封鎖的。
+HEADERS = {
+    'User-Agent': UA,
+    'Accept': 'text/csv,text/plain,*/*',
+    'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.8',
+    'Referer': 'https://www.taipower.com.tw/2289/2363/2367/2368/10264/normalPost',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-origin',
+}
+
+
 def session() -> requests.Session:
     s = requests.Session()
     s.mount('https://', RelaxedGovTwAdapter())
-    s.headers.update({'User-Agent': UA})
+    s.headers.update(HEADERS)
     return s
 
 
