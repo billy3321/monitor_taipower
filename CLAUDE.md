@@ -68,6 +68,17 @@
    ★ 也因此，「這個檔有 144 列」不代表抓到完整一天。
      要判斷抓到多少，看的是**有值的列數**。
 
+## 先跑這兩支（實作前）
+
+```bash
+python3 scripts/preflight.py         # 這台機器抓不抓得到台電官網
+python3 scripts/verify_fixtures.py   # 欄位對應驗收，零相依，直接可跑
+```
+
+`verify_fixtures.py` 已經把下面說的交叉檢查實作好了，並附真實 fixture
+（`tests/fixtures/`，2026-08-05 實抓）。**先跑過一次再開始寫**，
+你會直接看到正確的數字長什麼樣。
+
 ## 驗收：怎麼確認欄序沒對錯
 
 **兩支曲線是同一份用電的兩種切分，同一時點的總和必須吻合**（實測差 1 MW 以內）。
@@ -126,7 +137,14 @@
 ## 資料表
 
 **不要自己建表、不要自己寫 migration。** 表由 dashboard-app 的 `alembic_monitor`
-管理，schema 見 `docs/SCHEMA.md`。這個專案只 INSERT/UPDATE。
+管理（已建好在正式庫），schema 見 `docs/SCHEMA.md`。這個專案只 INSERT/UPDATE。
+
+★ 資料庫帳號用 **dashboard** 不是 crawler——`monitor_power_load_curve` 的
+  寫入權限只授予 dashboard，用 crawler 連得上但 INSERT 會 permission denied。
+
+★★ **每次執行都要另外寫一筆 `monitor_fetch_run`**（見 SCHEMA.md）。
+   少了它，這支爬蟲在「資料健康」頁面上等於不存在，沒人知道它死了——
+   而且因為前端有退回機制，畫面**看起來完全正常**。這條不能省。
 
 ## 時區
 

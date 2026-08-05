@@ -44,8 +44,13 @@ Base：`https://www.taipower.com.tw/d006/loadGraph/loadGraph/data/`
 python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
 cp config/config.yml.example config/config.yml   # 填密碼
 # 把三個憑證放進 config/ssl/（見下方）
-./venv/bin/python scripts/run_once.py            # 先手動跑一次確認
+./venv/bin/python scripts/preflight.py           # 1. 這台機器抓不抓得到？（不碰資料庫）
+python3 scripts/verify_fixtures.py               # 2. 欄位對應驗收（用內附 fixture，零相依）
+python3 scripts/verify_fixtures.py --live        #    同上但抓即時資料
 ```
+
+前兩支**實作完成前就能跑**。`verify_fixtures.py` 會印出兩支曲線的總和並比對——
+差 50 MW 以內才算欄位對應正確（實測差 1 MW）。這就是驗收條件。
 
 ## 憑證
 
@@ -61,6 +66,16 @@ config/ssl/client-key.pem      # 權限要 600
 ## 排程（macOS 用 launchd，不是 cron）
 
 `deployment/tw.nics.taipower-curve.plist` 是範本，安裝方式見 `docs/DEPLOY.md`。
+
+## 怎麼交到那台 Mac
+
+這個目錄本身就是一個獨立 git repo（已 `git init` 並提交）。任選一種：
+
+- `git bundle create tpc.bundle --all` 後把 bundle 檔帶過去 `git clone tpc.bundle`
+- 或直接整個目錄複製過去（**記得排除 `config/config.yml` 與 `config/ssl/*.pem`**，
+  那兩者含密碼與私鑰，本來就在 .gitignore 裡）
+
+到那台機器後：先跑 `scripts/preflight.py`，再讀 `CLAUDE.md` 開始實作。
 
 ## 這個專案**不做**什麼
 

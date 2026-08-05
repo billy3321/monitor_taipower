@@ -42,10 +42,14 @@ chmod 600 config/ssl/client-key.pem
 python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
 cp config/config.yml.example config/config.yml   # 填密碼與 pushgateway
-./venv/bin/python scripts/run_once.py            # 手動跑一次
+./venv/bin/python scripts/preflight.py           # 前置檢查（此時就能跑）
 ```
 
-手動跑那次要看到：抓到 3 支檔、寫入筆數、以及**兩支曲線總和吻合**的檢查通過。
+`preflight.py` 只驗「這台機器抓不抓得到」，**不寫資料庫**——實作完成前就能跑。
+三個檔都 ✓ 才有後面的事。
+
+實作完成後，正式進入點是 `scripts/run_once.py`（由那台機器的 AI 依 CLAUDE.md 撰寫）。
+它手動跑一次要看到：抓到 3 支檔、寫入筆數、以及**兩支曲線總和吻合**的檢查通過。
 
 ## 4. 排程（launchd）
 

@@ -7,7 +7,11 @@ database:
     # ★ Cloud SQL 的**公開 IP**（Mac 不在 VPC 內，走不了 10.x 私有 IP）
     host: "35.221.64.187"
     port: 5432
-    user: "crawler"
+    # ★★ 必須用 dashboard 不是 crawler：monitor_power_load_curve 的
+    #    INSERT/UPDATE 權限**只授予 dashboard**（2026-08-05 實測，
+    #    crawler 連得上但寫入會 permission denied）。
+    #    家族慣例也是這樣：dashboard 庫用 dashboard 帳號存取。
+    user: "dashboard"
     password: "CHANGE_ME"
     # ★ 這張表在 dashboard 的 monitor 庫，不是爬蟲庫
     database: "dashboard_monitor"
@@ -31,3 +35,8 @@ monitoring:
   pushgateway:
     enabled: false
     url: "http://CHANGE_ME:29095"
+  # 遙測的 instance_id。★ 不要用主機名：Mac 的主機名會隨網路變動
+  #（例如 "Billy的MacBook-Pro.local" → "...(2).local"），一變就會在
+  # Pushgateway 留下一組再也不更新的幽靈序列，然後永久誤報。
+  # 固定寫死一個識別字串。
+  instance_id: "mac-relay-01"
