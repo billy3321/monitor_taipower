@@ -3,7 +3,12 @@
 **表由 dashboard-app 的 `alembic_monitor` 建立與管理，這個專案不做 migration。**
 本檔是「這個爬蟲要寫成什麼形狀」的契約——欄位改動要兩邊一起。
 
-資料庫：`dashboard_monitor`（Cloud SQL，公開 IP + client certificate）
+資料庫：**`strait_info_monitor_prod`**（Cloud SQL，公開 IP + client certificate）
+
+★ 2026-08-06 起從 `dashboard_monitor` 搬到這裡，與 `monitor_strait_info` 同庫。
+舊庫的資料留著沒刪、最後一筆是 2026-08-06 15:55。**dashboard-app 那側的讀取
+也要跟著指到新庫**，否則能源分頁會退回逐機組加總的粗版曲線——
+而且畫面看起來完全正常，不會有人發現。
 
 ## `monitor_power_load_curve`
 

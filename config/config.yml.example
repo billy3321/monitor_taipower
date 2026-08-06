@@ -13,8 +13,9 @@ database:
     #    家族慣例也是這樣：dashboard 庫用 dashboard 帳號存取。
     user: "dashboard"
     password: "CHANGE_ME"
-    # ★ 這張表在 dashboard 的 monitor 庫，不是爬蟲庫
-    database: "dashboard_monitor"
+    # ★ 2026-08-06 起 monitor 這幾張表搬到 strait_info_monitor_prod
+    #   （原本是 dashboard_monitor，那邊的資料留著沒刪）。
+    database: "strait_info_monitor_prod"
     ssl_enabled: true
     ssl_mode: "require"
     ssl_ca_path: "config/ssl/server-ca.pem"

@@ -5,7 +5,7 @@
 ## 這個專案要做的事
 
 從一般網路的機器抓台電四支檔（三支 CSV ＋ `loadpara.json`），寫進 Cloud SQL 的
-`dashboard_monitor` 資料庫，每小時一次。就這樣。
+`strait_info_monitor_prod` 資料庫（2026-08-06 前是 `dashboard_monitor`），每小時一次。就這樣。
 不要順手加視覺化、不要加 web 介面、不要加 ORM 以外的抽象層。
 
 **DO NOT OVERDESIGN. DO NOT OVERENGINEER.**
