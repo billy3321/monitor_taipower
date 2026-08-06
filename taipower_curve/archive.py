@@ -20,6 +20,8 @@ import hashlib
 import logging
 import shutil
 
+from .parser import TAIPEI
+
 log = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -44,7 +46,10 @@ def archive_run(bodies: dict[str, bytes], url_of, *,
     """
     if not bodies:
         return None, None
-    local = fetched_at.astimezone()          # 目錄用本機（台北）時間，人找得到
+    # ★ 目錄名用台北時間（人要找得到），但要**明示** Asia/Taipei——
+    #   不可用 astimezone() 不帶參數：那會跟著這台機器的系統時區跑，
+    #   換個地區或改了系統設定，同一天的歸檔就會散在兩個日期目錄裡。
+    local = fetched_at.astimezone(TAIPEI)
     run_dir = RAW_DIR / f'{local:%Y-%m-%d}' / f'{local:%H%M%S}'
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -66,7 +71,8 @@ def prune(retention_days: int = RETENTION_DAYS) -> int:
     """
     if not RAW_DIR.exists():
         return 0
-    cutoff = datetime.now().date()
+    # 目錄名是台北日期，比對基準也要用台北日期，否則跨日前後會差一天
+    cutoff = datetime.now(TAIPEI).date()
     removed = 0
     for day_dir in RAW_DIR.iterdir():
         if not day_dir.is_dir():

@@ -4,7 +4,8 @@
 並用兩支曲線總和交叉驗證過）。改動這裡的欄位對應時 PARSER_VERSION 要跟著改。
 """
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 import csv
 import io
 import json
@@ -12,8 +13,15 @@ import json
 # 改欄位對應時要跟著改（會寫進 monitor_power_load_curve.parser_version）
 PARSER_VERSION = '2026-08-06.1'
 
-# ★ 台電時戳是台北時間且不帶時區，組 observed_at 時必須明確補 +08:00。
-TAIPEI = timezone(timedelta(hours=8))
+# ★ 台電時戳是台北時間且不帶時區，組 observed_at 時必須補上時區。
+#
+# ★★ 用 IANA 時區 ZoneInfo('Asia/Taipei')，**不要**寫成
+#    timezone(timedelta(hours=8))。兩者對今天的資料算出來一樣，但意義不同：
+#    前者說的是「台北這個地方的時間」，後者說的是「某個剛好是 +8 的偏移」。
+#    寫死偏移的東西一旦遇到時區規則變動（台灣 1979 年以前實施過日光節約時間）
+#    就會靜靜地錯，而且錯的是歷史資料重跑——那正是原文歸檔存在的目的。
+#    讓 tz 資料庫去回答偏移是多少，不要自己硬編。
+TAIPEI = ZoneInfo('Asia/Taipei')
 
 # ★ 來源單位是萬瓩，1 萬瓩 = 10 MW。寫進資料庫前一律換算成 MW，
 #   跟 monitor_power_unit_observation 同單位。

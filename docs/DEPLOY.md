@@ -52,7 +52,7 @@ cp config/config.yml.example config/config.yml   # 填密碼與 pushgateway
 **兩支曲線總和吻合**、**即時用電與能源別合計吻合**、寫入筆數、fetch_run 已記錄。
 
 ```bash
-./venv/bin/pytest -q                      # 61 條
+./venv/bin/pytest -q                      # 73 條
 ./venv/bin/python scripts/verify_fixtures.py
 ./venv/bin/python scripts/run_once.py
 ```

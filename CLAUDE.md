@@ -17,7 +17,7 @@
 dashboard-app 只負責讀取顯示。
 
 ★ 專案已經實作完成並在跑（2026-08-05 上線）。接手時要改東西，先跑
-`./venv/bin/pytest -q`（61 條）與 `scripts/verify_fixtures.py` 確認基準線是綠的，
+`./venv/bin/pytest -q`（73 條）與 `scripts/verify_fixtures.py` 確認基準線是綠的，
 改完再跑一次。**負向對照**（見「測試」節）不是選配。
 
 ## ★★ 欄位對應：這是本專案最容易錯的地方
@@ -278,12 +278,36 @@ curl -X DELETE "http://<pushgateway>/metrics/job/monitor_taipower_curve/instance
 
 ## 時區
 
-台電時戳是**台北時間且不帶時區**。組 `observed_at` 時必須明確補上 `+08:00`，
+台電時戳是**台北時間且不帶時區**。組 `observed_at` 時必須補上時區，
 不可以當成 UTC。「今日」也要用台北時區的今天——用 UTC 日期會在早上 8 點前錯一天。
+
+### ★★ 用 IANA 時區，不要硬編 `+08:00`
+
+```python
+from zoneinfo import ZoneInfo
+TAIPEI = ZoneInfo('Asia/Taipei')            # ✓
+TAIPEI = timezone(timedelta(hours=8))       # ✗ 不要
+```
+
+兩者對今天的資料算出來一樣，但意義不同：前者說的是「台北這個地方的時間」，
+後者說的是「某個剛好是 +8 的偏移」。硬編偏移的東西一旦遇到時區規則變動
+（台灣 1979 年以前實施過日光節約時間）就會靜靜地錯——而且錯的是**歷史資料重跑**，
+那正是原文歸檔存在的目的。讓 tz 資料庫去回答偏移是多少，不要自己算。
+
+★ 同理，`astimezone()` **不要不帶參數**：那會跟著這台機器的系統時區跑。
+要台北就明寫 `astimezone(TAIPEI)`，要 UTC 就明寫。
+
+★ 兩件事是獨立的，都要成立：**(a)** 每個寫進資料庫的 datetime 都是 aware 的；
+**(b)** 時區是 IANA 時區。只做到 (a) 仍然會踩到硬編偏移的坑。
+naive datetime 進到 `timestamptz` 欄位，資料庫會拿連線的 `TimeZone` 設定去猜，
+猜錯就整批偏移，而且畫面看起來完全正常。
+
+`tests/test_timezone.py` 把這兩條都釘住了，包括「原始碼裡不准再出現
+`timedelta(hours=8)`」這種檢查。
 
 ## 測試
 
-現有 61 條（`./venv/bin/pytest -q`）。動到解析或抓取就要跑，而且至少要保住這幾條：
+現有 73 條（`./venv/bin/pytest -q`）。動到解析或抓取就要跑，而且至少要保住這幾條：
 
 1. 欄位對應（用 fixture，斷言燃氣/太陽能/風力等對到正確的值）
 2. **兩支曲線總和吻合**的交叉測試 ← 最有價值的一條
@@ -292,7 +316,8 @@ curl -X DELETE "http://<pushgateway>/metrics/job/monitor_taipower_curve/instance
 5. 整點時間 `00` 與 `00:10` 兩種格式都能解析
 6. 未來時段（`,`）整列跳過，不產生任何 mw=0 的點
 7. `loadpara` 的即時用電＝同時點能源別合計
-8. 內容驗證：HTML 挑戰頁、空回應、JSON 端點吐 CSV 都要當失敗
+8. 時區：每個 datetime 都是 aware，且用 IANA 時區不是硬編 +08:00
+9. 內容驗證：HTML 挑戰頁、空回應、JSON 端點吐 CSV 都要當失敗
 
 ### ★ 負向對照不是選配
 
@@ -307,6 +332,8 @@ curl -X DELETE "http://<pushgateway>/metrics/job/monitor_taipower_curve/instance
 | 太陽能與重油對調 | 具體數值斷言、太陽能夜間為 0 |
 | 即時供電能力對到 `fore_*` | 兩個分母不同那條 |
 | 拿掉 content-type 檢查 | HTML 挑戰頁 |
+| `TAIPEI` 改回 `timezone(timedelta(hours=8))` | IANA 時區那兩條 |
+| `astimezone(TAIPEI)` 改回裸 `astimezone()` | 歸檔不依賴機器時區那條 |
 
 ★ 做負向對照時如果「改壞了測試卻還是綠的」，先確認不是 **Python bytecode 快取**
 在騙你：改回去的檔案若**大小相同且在同一秒內寫入**，`.pyc` 的 (mtime, size)
