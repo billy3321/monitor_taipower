@@ -1,7 +1,10 @@
 # 資料表規格（與 dashboard-app 的契約）
 
-**表由 dashboard-app 的 `alembic_monitor` 建立與管理，這個專案不做 migration。**
+**表由 `monitor_strait_info` 擁有與管理，這個專案不做 migration。**
 本檔是「這個爬蟲要寫成什麼形狀」的契約——欄位改動要兩邊一起。
+
+★ 本專案是這個庫的**第二個寫入者，只寫自己的兩張表**（`monitor_power_load_curve`、
+`monitor_fetch_run`）。一表一寫入者，不要跨線。dashboard-app 只讀不寫。
 
 資料庫：**`strait_info_monitor_prod`**（Cloud SQL，公開 IP + client certificate）
 

@@ -45,11 +45,17 @@ cp config/config.yml.example config/config.yml   # 填密碼與 pushgateway
 ./venv/bin/python scripts/preflight.py           # 前置檢查（此時就能跑）
 ```
 
-`preflight.py` 只驗「這台機器抓不抓得到」，**不寫資料庫**——實作完成前就能跑。
-三個檔都 ✓ 才有後面的事。
+`preflight.py` 只驗「這台機器抓不抓得到」，**不寫資料庫也不需要 config**——
+所以它能乾淨地把「抓不到台電」跟「寫不進資料庫」分開。三個檔都 ✓ 才有後面的事。
 
-實作完成後，正式進入點是 `scripts/run_once.py`（由那台機器的 AI 依 CLAUDE.md 撰寫）。
-它手動跑一次要看到：抓到 3 支檔、寫入筆數、以及**兩支曲線總和吻合**的檢查通過。
+正式進入點是 `scripts/run_once.py`。手動跑一次要看到：抓到 4 支檔、原文已歸檔、
+**兩支曲線總和吻合**、**即時用電與能源別合計吻合**、寫入筆數、fetch_run 已記錄。
+
+```bash
+./venv/bin/pytest -q                      # 61 條
+./venv/bin/python scripts/verify_fixtures.py
+./venv/bin/python scripts/run_once.py
+```
 
 ## 4. 排程（launchd）
 
@@ -71,10 +77,12 @@ tail -f /tmp/taipower-curve.log
 
 ## 5. Mac 特有的坑
 
-- **睡眠**：Mac 睡著時 launchd 不會跑。`StartInterval` 的排程在喚醒後會補跑一次，
-  但睡了 8 小時只會補一次，不會補 8 次。
+- **睡眠**：Mac 睡著時 launchd 不會跑。錯過的排程在喚醒後**只補跑一次**，
+  睡了 8 小時不會補 8 次。
   → 這台機器要設成不睡（系統設定 → 電池／電源 → 防止自動進入睡眠），
     或接受夜間有缺口。**缺口不是「那時候沒用電」，圖上要看得出是缺資料。**
+  → ★ 夜間睡著最貴：`23:55`／`23:59` 那兩次補不回來（檔案 00:00 換日重置）。
+    白天漏掉幾次則不損失曲線——當日累積檔會補齊。詳見 README 的健康度一節。
 - **App Nap**：長時間背景執行可能被降頻。用 launchd 定時啟動短命程序
   （每次跑完就結束）比常駐程序安全。
 - **憑證權限**：`client-key.pem` 不是 600 的話 psycopg2 會拒絕連線。
@@ -82,11 +90,16 @@ tail -f /tmp/taipower-curve.log
 ## 6. 確認它真的在做事
 
 ```sql
-SELECT kind, count(*), min(observed_at), max(observed_at)
+SELECT kind, count(*), count(DISTINCT observed_at) AS 時點數,
+       max(observed_at AT TIME ZONE 'Asia/Taipei')::time AS 最新
 FROM monitor_power_load_curve
 WHERE (observed_at AT TIME ZONE 'Asia/Taipei')::date
       = (now() AT TIME ZONE 'Asia/Taipei')::date
-GROUP BY 1;
+GROUP BY 1 ORDER BY 1;
 ```
 
-正常應該是 `fuel` 12 × N 點、`area` 4 × N 點，N 隨當日時間增長到 144。
+正常應該是 `fuel` 12 × N 點、`area` 4 × N 點，N 隨當日時間增長到 144；
+`area_gen`／`area_load`／`capacity` 則是每小時一點（那三者不累積）。
+
+更完整的對帳 SQL（斷點偵測、每次執行的結果）與四種失敗的分辨方式，
+見 README 的「確認它真的在做事」與「抓取健康度」兩節。
