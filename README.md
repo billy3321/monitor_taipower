@@ -25,18 +25,33 @@
 
 ## 要抓什麼
 
-三支 CSV，10 分鐘一點、**當日累積**：
+四支檔，Base：`https://www.taipower.com.tw/d006/loadGraph/loadGraph/data/`
 
-| 檔案 | 內容 |
-|---|---|
-| `.../loadGraph/data/loadfueltype.csv` | 今日用電曲線圖－依燃料類別（12 欄）|
-| `.../loadGraph/data/loadareas.csv` | 今日用電曲線圖－依區域別（4 欄）|
-| `.../loadGraph/data/genloadareaperc.csv` | 各區發電／用電占比（上方那排長條）|
+| 檔案 | 內容 | 累積性 |
+|---|---|---|
+| `loadfueltype.csv` | 今日用電曲線－依燃料類別（12 欄）| **當日累積**，一抓拿回整天 |
+| `loadareas.csv` | 今日用電曲線－依區域別（4 欄）| **當日累積**，一抓拿回整天 |
+| `genloadareaperc.csv` | 各區發電／用電占比 | **只有當下**，一次一點 |
+| `loadpara.json` | 即時供電能力、即時用電、尖峰預估 | **只有當下**，一次一點 |
 
-Base：`https://www.taipower.com.tw/d006/loadGraph/loadGraph/data/`
-
-**★ 因為檔案是「當日累積」，每小時抓一次就能拿到全部 144 個 10 分鐘點——
+**★ 因為前兩支是「當日累積」，每小時抓一次就能拿到全部 144 個 10 分鐘點——
 不需要每 10 分鐘跑。** 這是這個設計最重要的一點。
+★ 但後兩支不累積，解析度就等於執行頻率（每小時一點），漏掉的永遠補不回來。
+
+### loadpara.json：兩個「供電能力」不是同一件事
+
+| 欄位 | 意義 | 會不會變 |
+|---|---|---|
+| `real_hr_maxi_sply_capacity` | **即時供電能力** | 每次抓都不同 |
+| `fore_maxi_sply_capacity` | 今日**預估**最大供電能力 | 一天固定 |
+
+★★ 台電網頁上那個「使用率 %」的分母是**即時供電能力**，不是今日最大供電能力。
+拿錯分母算出來會差約 1 個百分點（2026-08-06 實測：81% vs 82%）。
+兩個值都有存，`kind='capacity'`，見 `docs/SCHEMA.md`。
+
+★ 這四支的欄位在開放資料平台 `service.taipower.com.tw` **都沒有**
+（實測 d006002~d006008、d006021 全 404，只有 d006001 機組發電量存在），
+所以不存在「跟 opendata 重複抓」的問題。
 
 ## 快速開始
 
@@ -76,6 +91,56 @@ config/ssl/client-key.pem      # 權限要 600
   那兩者含密碼與私鑰，本來就在 .gitignore 裡）
 
 到那台機器後：先跑 `scripts/preflight.py`，再讀 `CLAUDE.md` 開始實作。
+
+## 原文歸檔
+
+★ 平台紀律：**原文全存，解析錯了可以重跑。** 每次執行把四支檔的原始 bytes
+存進 `data/raw/YYYY-MM-DD/HHMMSS/`，附一份 MANIFEST 記錄每支檔的
+**來源網址、bytes 數、sha256**。`monitor_fetch_run.raw_uri` 指到那個目錄、
+`raw_sha256` 是 MANIFEST 的雜湊（MANIFEST 裡有每支檔各自的雜湊，驗一個等於驗全部）。
+
+- 歸檔在**解析之前**做——解析失敗才是最需要原文的時候。
+- 保留 90 天（約 25 MB），舊的自動清掉。`data/` 不進 git。
+- 那些沒進資料庫的欄位（使用率、備轉容量率、indicator、publish_time、
+  昨日摘要）**全部在原文裡**，需要時回去撈。
+
+## 抓取健康度：漏幾次算正常？
+
+★ **判斷標準不是「漏幾次」，是「漏在哪裡」**——因為兩支曲線是當日累積檔，
+下一次成功的執行會把整天補回來。
+
+| 情境 | 資料損失 |
+|---|---|
+| 漏掉 00:55–22:55 之間任何幾次 | **沒有損失**，下次成功就補回整天曲線 |
+| 漏掉當天最後兩次（23:55、23:59）| 當天尾巴永久遺失（檔案 00:00 換日重置）|
+| 整天都沒成功 | 該日曲線永久遺失 |
+| 任何一次漏掉 | `area_gen` / `capacity` 少一個時間點，**永久補不回**（不累積）|
+
+實務門檻：
+
+- **存活告警**：`time() - scrapy_last_success_timestamp_seconds > 3 小時`
+  （＝連續 3 次失敗）。這條已在監控端設好。
+- **要查但先別緊張**：一天 25 次裡成功 ≥ 23 次。曲線資料是完整的，
+  只是 `capacity` 有幾個洞。
+- **要動手**：連續兩天成功 < 20 次，或 23:55／23:59 那兩次連續失敗。
+- 對帳用的 SQL 見下面「確認它真的在做事」。
+
+### Mac 會關機、睡眠、換網路——各自長什麼樣
+
+| 症狀 | 原因 | 怎麼確認 |
+|---|---|---|
+| `fetch_run` 整段沒有紀錄，遙測也沒更新 | 關機或睡眠 | 機器開著沒？`pmset -g` 看 sleep |
+| `status='error'`、訊息提到 CloudFront/HTML | 換網路，出口 IP 被擋 | `python3 scripts/preflight.py` |
+| `status='error'`、訊息說「資料庫端」 | 換網路，IP 不在 Cloud SQL 白名單 | `curl -s https://api.ipify.org` |
+| 執行正常但遙測 WARNING 推不上去 | 換網路，IP 不在 Pushgateway 防火牆白名單 | `curl -m 20 <pushgateway>/metrics` |
+
+★ launchd 的補跑行為：機器睡著時錯過的 `StartCalendarInterval`，**喚醒後只補跑一次**，
+不會把錯過的每一次都補。所以睡 8 小時只會補 1 次——這台機器應設成不睡。
+關機期間錯過的則是在下次登入載入 LaunchAgent 時跑一次（`RunAtLoad`）。
+
+★ 失敗時遙測**確實會推**（2026-08-06 實測過資料庫連不上與程式未預期例外兩種情境）：
+`scrapy_log_errors` 會 >0，而 `scrapy_last_success_timestamp_seconds`
+**不會被更新也不會被洗掉**，所以存活告警算得出「多久沒成功了」。
 
 ## 這個專案**不做**什麼
 

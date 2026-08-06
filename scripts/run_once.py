@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""正式進入點：抓三支 CSV → 解析 → 交叉檢查 → upsert → fetch_run → 遙測。
+"""正式進入點：抓 → 歸檔原文 → 解析 → 交叉檢查 → upsert → fetch_run → 遙測。
 
 launchd 每小時跑一次（deployment/tw.nics.taipower-curve.plist）。
 短命程序：跑完就結束，不常駐。
 
-失敗分級（★ 兩種失敗長得完全不一樣，訊息要讓人一眼分清楚）：
+失敗分級（★ 幾種失敗長得完全不一樣，訊息要讓人一眼分清楚）：
   - 抓不到台電（403/HTML/逾時）→ 台電端。status='error'，record_count=NULL。
   - 連不上資料庫             → DB 端（IP 沒授權？憑證權限？）。
     fetch_run 也寫不了，至少把遙測推出去。
+  - 程式自己爆掉             → 最外層還是會推遙測（errors>0），
+    否則「爬蟲壞了」會長得跟「機器關機了」一樣，兩者要修的東西完全不同。
 """
 from datetime import datetime, timezone
 import logging
@@ -18,6 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))               # launchd 的 cwd 是專案根，但保險起見
 
+from taipower_curve import archive                   # noqa: E402
 from taipower_curve import config as cfgmod          # noqa: E402
 from taipower_curve import db, fetch, telemetry      # noqa: E402
 from taipower_curve import parser as P               # noqa: E402
@@ -32,14 +35,39 @@ def main() -> int:
         datefmt='%Y-%m-%d %H:%M:%S')
     started = time.monotonic()
     now = datetime.now(timezone.utc)
-    cfg = cfgmod.load()
-
+    cfg = None
     errors = 0
     items = 0
     status = 'error'
+
+    try:
+        cfg = cfgmod.load()
+        status, items, errors = _run(cfg, now, started)
+    except Exception as exc:                          # noqa: BLE001
+        # ★ 最外層防線：任何沒預期到的例外都不能讓這支「安靜地死掉」。
+        log.exception('未預期的例外，這次執行失敗：%s', exc)
+        errors += 1
+        status = 'error'
+
+    # ★ 遙測一定要推——失敗也要推。沒有遙測 = 爬蟲死了沒人知道。
+    if cfg is not None:
+        telemetry.push(cfg, run_ts=now.timestamp(), success=(status == 'ok'),
+                       items=items, errors=errors,
+                       duration=time.monotonic() - started)
+    else:
+        log.error('連 config 都讀不到，無法推遙測——存活告警會因為久未更新而燒，'
+                  '那是正確行為')
+
+    log.info('結束：status=%s items=%d errors=%d %.1fs',
+             status, items, errors, time.monotonic() - started)
+    return 0 if status == 'ok' else 1
+
+
+def _run(cfg: dict, now: datetime, started: float) -> tuple[str, int, int]:
+    errors = 0
+    items = 0
     note_parts: list[str] = []
     points: list[P.Point] = []
-    http_status = None
 
     # ── 1. 抓 ────────────────────────────────────────────────────
     result = fetch.fetch_all(cfg['crawler']['user_agent'],
@@ -48,21 +76,36 @@ def main() -> int:
     for name, why in result.errors.items():
         log.error('台電端抓取失敗：%s', why)
         errors += 1
+        note_parts.append(f'{name} 失敗')
     for name, body in result.bodies.items():
         log.info('抓到 %s（%d bytes）', name, len(body))
 
-    # ── 2. 解析 ──────────────────────────────────────────────────
+    # ── 2. 歸檔原文（★ 在解析之前——解析失敗才是最需要原文的時候）──
+    raw_uri = raw_sha = None
+    try:
+        run_dir, raw_sha = archive.archive_run(result.bodies, fetch.source_url,
+                                               fetched_at=now)
+        if run_dir is not None:
+            raw_uri = str(run_dir)
+            log.info('原文已歸檔：%s（%d 個檔）', run_dir, len(result.bodies))
+        archive.prune()
+    except Exception as exc:                          # noqa: BLE001
+        # 歸檔失敗不該讓整次執行失敗——資料進得了資料庫比留副本重要
+        log.warning('原文歸檔失敗（不影響寫入）：%s — %s', type(exc).__name__, exc)
+        errors += 1
+
+    # ── 3. 解析 ──────────────────────────────────────────────────
     b = result.bodies
     try:
         points = P.parse_all(b.get('loadfueltype.csv'), b.get('loadareas.csv'),
-                             b.get('genloadareaperc.csv'))
+                             b.get('genloadareaperc.csv'), b.get('loadpara.json'))
     except P.ParseError as exc:
         # 欄數不符＝來源改版。寧可整次失敗也不要猜著對寫進錯的標籤。
         log.error('解析失敗（來源可能改版，欄位對應要人工重新驗證）：%s', exc)
         errors += 1
         points = []
 
-    # ── 3. 交叉檢查：兩支曲線總和必須吻合 ─────────────────────────
+    # ── 4. 交叉檢查 ──────────────────────────────────────────────
     kinds = {p.kind for p in points}
     if {'fuel', 'area'} <= kinds:
         checked = P.cross_check(points)
@@ -83,16 +126,32 @@ def main() -> int:
             else:
                 log.info('交叉檢查通過：%s 兩邊總和差 %.0f MW', t, diff)
 
-    # ── 4. 寫入 ──────────────────────────────────────────────────
+    # loadpara 的即時用電 vs 同時點能源別合計（驗時點掛對了沒有）
+    cap = P.cross_check_capacity(points)
+    if cap is not None:
+        curr, ftot = cap
+        diff = abs(curr - ftot)
+        if diff >= P.CAPACITY_CHECK_TOLERANCE_MW:
+            log.error('即時用電 %.0f MW 與同時點能源別合計 %.0f MW 差 %.0f——'
+                      'loadpara 與曲線不同步，這次不寫 capacity', curr, ftot, diff)
+            errors += 1
+            points = [p for p in points if p.kind != 'capacity']
+        else:
+            log.info('即時供電檢查通過：即時用電與能源別合計差 %.0f MW', diff)
+
+    # ── 5. 寫入 ──────────────────────────────────────────────────
+    kinds = {p.kind for p in points}
     curve_times = sorted({p.observed_at for p in points})
     try:
         engine = db.make_engine(cfg)
         items = db.upsert_points(engine, points, fetched_at=now)
         if items:
+            counts = {k: sum(1 for p in points if p.kind == k) for k in sorted(kinds)}
             log.info('已 upsert %d 筆（%s）', items,
-                     '; '.join(f'{k}={sum(1 for p in points if p.kind == k)}'
-                               for k in ('fuel', 'area', 'area_gen', 'area_load')
-                               if k in kinds))
+                     '; '.join(f'{k}={v}' for k, v in counts.items()))
+            note_parts.append('; '.join(f'{k}={v}' for k, v in counts.items()))
+        else:
+            note_parts.append('無資料')
 
         if errors == 0 and items > 0:
             status = 'ok'
@@ -101,14 +160,7 @@ def main() -> int:
         else:
             status = 'error'
 
-        for name in fetch.FILES:
-            if name in result.errors:
-                note_parts.append(f'{name} 失敗')
-        counts = {k: sum(1 for p in points if p.kind == k) for k in sorted(kinds)}
-        note_parts.append('; '.join(f'{k}={v}' for k, v in counts.items()) or '無資料')
-
-        # ★★ 每次執行都要寫一筆 fetch_run，失敗也要寫——
-        #    少了它，這支爬蟲在「資料健康」頁面上等於不存在。
+        # ★★ 每次執行都要寫一筆 fetch_run，失敗也要寫。
         db.insert_fetch_run(
             engine, fetched_at=now, status=status,
             record_count=items if points or status != 'error' else None,
@@ -118,22 +170,14 @@ def main() -> int:
             http_status=http_status,
             duration_ms=int((time.monotonic() - started) * 1000),
             note='; '.join(note_parts)[:500],
-            raw_uri=fetch.BASE)
-        log.info('fetch_run 已記錄：status=%s record_count=%s',
-                 status, items if points or status != 'error' else None)
+            raw_uri=raw_uri, raw_sha256=raw_sha)
+        log.info('fetch_run 已記錄：status=%s record_count=%s', status, items)
     except db.DatabaseError as exc:
+        # ★ 與「抓不到台電」是兩種完全不同的失敗，訊息已經在 DatabaseError 裡分好
         log.error('%s', exc)
         errors += 1
         status = 'error'
-
-    # ── 5. 遙測（最後防線：連 DB 都失敗時它是唯一的求救訊號）────────
-    telemetry.push(cfg, run_ts=now.timestamp(), success=(status == 'ok'),
-                   items=items, errors=errors,
-                   duration=time.monotonic() - started)
-
-    log.info('結束：status=%s items=%d errors=%d %.1fs',
-             status, items, errors, time.monotonic() - started)
-    return 0 if status == 'ok' else 1
+    return status, items, errors
 
 
 if __name__ == '__main__':

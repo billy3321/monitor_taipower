@@ -73,6 +73,52 @@ ON CONFLICT (observed_at, kind, label) DO UPDATE
 
 ★ 一樣要換算：來源萬瓩 → MW（×10）。
 
+## `loadpara.json` → `kind='capacity'`（2026-08-06 新增）
+
+★★ **這是新的 kind，dashboard-app 那邊要知道。** 沒有新表也沒有新欄位，
+沿用 `monitor_power_load_curve` 既有的形狀。
+
+| label | 來源欄位 | 意義 |
+|---|---|---|
+| `即時用電` | `curr_load` | 當下用電（＝同時點能源別合計，實測差 0 MW）|
+| `即時供電能力` | `real_hr_maxi_sply_capacity` | **當下**供電能力，每次抓都不同 |
+| `今日最大供電能力` | `fore_maxi_sply_capacity` | 今日**預估**值，一天固定 |
+| `尖峰預估用電` | `fore_peak_dema_load` | 今日預估尖峰負載 |
+| `尖峰預估備轉容量` | `fore_peak_resv_capacity` | 今日預估尖峰備轉 |
+
+★★ **儀表刻度的分母要用「即時供電能力」**，不是「今日最大供電能力」——
+台電網頁上的「使用率 %」用的是前者。2026-08-06 實測：
+即時用電 40,582 MW ÷ 即時供電能力 49,879 MW = 81%（與網頁一致），
+÷ 今日最大供電能力 49,551 MW = 82%（差一個百分點）。
+
+★ **這個檔沒有自己的時戳**（`publish_time` 是預估值的發布時間，不是 `curr_load`
+的時間）。`observed_at` 掛在**同次抓到的曲線最新時點**上。這不是將就：
+`curr_load` 與該時點的能源別合計實測完全相同，而且每次執行都會重驗
+（差 ≥100 MW 就不寫 capacity 並記一次錯誤）。
+
+★ 一樣是萬瓩 → MW（×10）。
+
+**沒有進資料庫的欄位**：使用率 `curr_util_rate`、備轉容量率
+`fore_peak_resv_rate`、燈號 `fore_peak_resv_indicator`、尖峰時段
+`fore_peak_hour_range`、發布時間 `publish_time`、昨日摘要 `yday_*`。
+理由是 `mw` 欄位的語意就是 MW，把百分比塞進去遲早有人拿它去加總；
+文字欄更沒地方放。**這些全部保存在原文歸檔裡**（見下），
+而且比率本來就能從 MW 值回推。若 dashboard 需要把它們入庫，
+請那邊開欄位，這裡再補寫。
+
+## 原文歸檔與 `raw_uri` / `raw_sha256` 的語意
+
+★ 平台紀律「原文全存」的落實方式（2026-08-06 起）：
+
+- `raw_uri` = 這次執行的**歸檔目錄**絕對路徑（在那台 Mac 上），
+  例如 `/Users/.../data/raw/2026-08-06/142044`
+- `raw_sha256` = 該目錄下 `MANIFEST.txt` 的 sha256
+- `MANIFEST.txt` 每行是「檔名 → 來源網址 → bytes → 該檔 sha256」，
+  所以驗 MANIFEST 一份等於驗全部四支檔
+
+★ 這改變了 `raw_uri` 先前的語意（原本放 base URL）。來源網址現在記在
+MANIFEST 裡，每支檔各自對應——比一個共用的 base URL 精確。
+
 ## label 的合法值
 
 `kind='fuel'`（12 個，順序即堆疊順序）：
@@ -92,6 +138,12 @@ ON CONFLICT (observed_at, kind, label) DO UPDATE
 
 ```
 北部, 中部, 南部, 東部
+```
+
+`kind='capacity'`（5 個，2026-08-06 新增）：
+
+```
+即時用電, 即時供電能力, 今日最大供電能力, 尖峰預估用電, 尖峰預估備轉容量
 ```
 
 ★ 這兩組順序**就是台電圖上由下往上的堆疊順序**，dashboard-app 會照這個順序畫。

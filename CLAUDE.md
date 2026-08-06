@@ -4,8 +4,9 @@
 
 ## 這個專案要做的事
 
-從一般網路的機器抓台電三支 CSV，寫進 Cloud SQL 的 `dashboard_monitor` 資料庫，
-每小時一次。就這樣。不要順手加視覺化、不要加 web 介面、不要加 ORM 以外的抽象層。
+從一般網路的機器抓台電四支檔（三支 CSV ＋ `loadpara.json`），寫進 Cloud SQL 的
+`dashboard_monitor` 資料庫，每小時一次。就這樣。
+不要順手加視覺化、不要加 web 介面、不要加 ORM 以外的抽象層。
 
 **DO NOT OVERDESIGN. DO NOT OVERENGINEER.**
 
@@ -148,8 +149,29 @@ python3 scripts/verify_fixtures.py   # 欄位對應驗收，零相依，直接�
   （家族慣例，方便 Chrome 版本老舊時統一調整）。
 
 ### 爬取自律
-每次執行只打 3 個請求、每小時一次。不要加重試風暴。
-兩個請求之間 sleep 一下。
+每次執行只打 **4** 個請求（2026-08-06 起多抓 `loadpara.json`）、每小時一次。
+不要加重試風暴。兩個請求之間 sleep 一下。
+
+### ★ 原文全存，解析錯了可以重跑
+
+平台紀律。每次執行把四支檔的原始 bytes 存進 `data/raw/YYYY-MM-DD/HHMMSS/`，
+附 MANIFEST 記錄來源網址／bytes／sha256，保留 90 天。見 `taipower_curve/archive.py`。
+
+★ **歸檔要在解析之前做。** 解析失敗才是最需要原文的時候——先存下來，
+之後才有得重跑；反過來做的話，來源改版那天你會兩手空空。
+
+★ 歸檔失敗**不該讓整次執行失敗**（記 WARNING 與一次 error 就好）：
+資料進得了資料庫比留副本重要。
+
+### ★ 空回應／挑戰頁不等於「今天沒資料」
+
+`content-type` 與內容**都要驗**，只驗一個都會被騙：
+
+- 只看狀態碼：CloudFront 擋頁是 HTTP 200 + HTML（踩過的坑）
+- 只看 content-type：擋頁有時仍標成 `text/csv`
+- 只看內容：content-type 明說是 HTML 就別再猜了
+
+JSON 端點要真的 `json.loads` 得起來才算成功。見 `fetch._validate()`。
 
 ## 遙測（必做）
 

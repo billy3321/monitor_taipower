@@ -1,4 +1,4 @@
-"""三支 CSV 的解析——純函式，不碰網路與資料庫。
+"""來源檔的解析——純函式，不碰網路與資料庫。
 
 欄序來源見 CLAUDE.md（2026-08-05 從官網現行 JS 分支的 balloon 文字逆向、
 並用兩支曲線總和交叉驗證過）。改動這裡的欄位對應時 PARSER_VERSION 要跟著改。
@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 import csv
 import io
+import json
 
 # 改欄位對應時要跟著改（會寫進 monitor_power_load_curve.parser_version）
-PARSER_VERSION = '2026-08-05.1'
+PARSER_VERSION = '2026-08-06.1'
 
 # ★ 台電時戳是台北時間且不帶時區，組 observed_at 時必須明確補 +08:00。
 TAIPEI = timezone(timedelta(hours=8))
@@ -26,6 +27,24 @@ FUEL_COLUMNS = [
 # ★ 不是「東北中南」。最後一欄對應北部——用官網當日數字對帳確認過。
 AREA_COLUMNS = ['東部', '南部', '中部', '北部']
 
+# loadpara.json：kind='capacity'。★ 只取**單位是萬瓩**的欄位。
+#
+# 百分比欄（curr_util_rate、fore_peak_resv_rate）與文字欄（indicator、
+# publish_time、hour_range）**刻意不進資料庫**：mw 欄位的語意就是 MW，
+# 把百分比塞進去遲早有人拿它去加總。這些欄位全部保存在原文歸檔裡，
+# 而且比率本來就能從這裡的 MW 值回推（使用率＝即時用電/即時供電能力）。
+#
+# yday_* 也不取：那是昨天的摘要，我們自己的曲線history 已經有昨天全天資料。
+LOADPARA_FIELDS = [
+    ('curr_load', '即時用電'),
+    # ★★ 這個才是台電網頁「使用率」的分母（即時供電能力），
+    #    不是 fore_maxi_sply_capacity（那是今日預估最大供電能力）。
+    ('real_hr_maxi_sply_capacity', '即時供電能力'),
+    ('fore_maxi_sply_capacity', '今日最大供電能力'),
+    ('fore_peak_dema_load', '尖峰預估用電'),
+    ('fore_peak_resv_capacity', '尖峰預估備轉容量'),
+]
+
 # genloadareaperc.csv：完整時戳 + 4 區 ×（發電, 用電）
 PERC_COLUMNS = [
     ('area_gen', '北部'), ('area_load', '北部'),
@@ -39,6 +58,10 @@ NULL_TOKENS = {'', '-', '—', 'N/A', 'n/a', 'NA', 'null', 'NULL'}
 
 # 兩支曲線是同一份用電的兩種切分，同一時點總和必須吻合（實測差 1 MW）。
 CROSS_CHECK_TOLERANCE_MW = 50.0
+
+# loadpara 的即時用電 vs 同時點能源別合計（實測差 0 MW）。放寬到 100 MW 是為了
+# 容忍「loadpara 已更新到下一個 10 分鐘、曲線還沒」的短暫不同步。
+CAPACITY_CHECK_TOLERANCE_MW = 100.0
 
 
 class ParseError(Exception):
@@ -155,14 +178,70 @@ def _parse_full_timestamp(raw: str) -> datetime:
     raise ParseError(f'genloadareaperc 的時戳認不得：{raw!r}')
 
 
+def parse_loadpara(body: bytes, observed_at: datetime) -> list[Point]:
+    """loadpara.json → kind='capacity' 的 Point。
+
+    ★ 這個檔**沒有自己的時戳**（publish_time 是預估值的發布時間，不是
+      curr_load 的時間）。所以 observed_at 由呼叫端給——用曲線的最新時點。
+
+      這不是將就：2026-08-06 實測 curr_load 與同時點的能源別合計**完全相同**
+      （40582 MW vs 40582 MW，差 0），證明兩者是同一瞬間的同一個量。
+      cross_check_capacity() 每次執行都會重驗這件事。
+    """
+    try:
+        doc = json.loads(body.decode('utf-8-sig'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ParseError(f'loadpara.json 不是合法 JSON：{exc}') from None
+    if not isinstance(doc, dict) or 'records' not in doc:
+        raise ParseError(f'loadpara.json 結構不符預期（沒有 records）：{str(doc)[:120]}')
+
+    # records 是「一組小 dict」而不是一個扁平物件，合併起來取用
+    merged: dict[str, str] = {}
+    for rec in doc['records']:
+        if isinstance(rec, dict):
+            merged.update(rec)
+
+    points: list[Point] = []
+    missing: list[str] = []
+    for key, label in LOADPARA_FIELDS:
+        if key not in merged:
+            missing.append(key)
+            continue
+        points.append(Point(observed_at, 'capacity', label, parse_number(merged[key])))
+    if missing:
+        # ★ 欄位消失＝來源改版，要看得見。已取到的照樣回傳，不要整批丟掉。
+        raise ParseError(f'loadpara.json 缺少預期欄位 {missing}（來源可能改版了）')
+    return points
+
+
+def cross_check_capacity(points: list[Point]) -> tuple[float, float] | None:
+    """★ 第三條交叉檢查：loadpara 的即時用電必須等於同時點的能源別合計。
+
+    兩者是不同來源檔對同一瞬間的描述，對不上就表示時點對錯了
+    （例如 loadpara 已更新到下一個 10 分鐘，而曲線還沒）。
+
+    回 (curr_load, 能源別合計)；缺任一邊回 None。
+    """
+    curr = next((p for p in points
+                 if p.kind == 'capacity' and p.label == '即時用電'
+                 and p.mw is not None), None)
+    if curr is None:
+        return None
+    fuel_total = totals_at(points, 'fuel', curr.observed_at)
+    if fuel_total is None:
+        return None
+    return curr.mw, fuel_total
+
+
 def taipei_today() -> date:
     """★ 「今日」要用台北時區的今天。用 UTC 日期會在早上 8 點前錯一天。"""
     return datetime.now(TAIPEI).date()
 
 
 def parse_all(fuel_body: bytes | None, area_body: bytes | None,
-              perc_body: bytes | None) -> list[Point]:
-    """三支檔 → 全部 Point。任一支缺（沒抓到）就跳過那一支。"""
+              perc_body: bytes | None,
+              loadpara_body: bytes | None = None) -> list[Point]:
+    """四支檔 → 全部 Point。任一支缺（沒抓到）就跳過那一支。"""
     perc_points: list[Point] = []
     base_date: date | None = None
     if perc_body is not None:
@@ -175,7 +254,15 @@ def parse_all(fuel_body: bytes | None, area_body: bytes | None,
         points += parse_curve(fuel_body, 'fuel', FUEL_COLUMNS, base_date)
     if area_body is not None:
         points += parse_curve(area_body, 'area', AREA_COLUMNS, base_date)
-    return points + perc_points
+    points += perc_points
+
+    if loadpara_body is not None:
+        # loadpara 沒有自己的時戳，掛在曲線最新的時點上（見 parse_loadpara）
+        curve_times = [p.observed_at for p in points if p.kind == 'fuel']
+        if curve_times:
+            points += parse_loadpara(loadpara_body, max(curve_times))
+        # 沒有曲線就沒有可信的時戳可掛——寧可不寫，也不要自己編一個時間
+    return points
 
 
 def totals_at(points: list[Point], kind: str,

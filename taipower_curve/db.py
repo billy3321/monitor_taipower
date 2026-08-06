@@ -38,12 +38,12 @@ ON CONFLICT (observed_at, kind, label) DO UPDATE
 _INSERT_RUN = text("""
 INSERT INTO monitor_fetch_run
     (source_id, fetched_at, status, record_count, data_timestamp,
-     covered_span, http_status, duration_ms, note, raw_uri)
+     covered_span, http_status, duration_ms, note, raw_uri, raw_sha256)
 VALUES (:source_id, :fetched_at, :status, :record_count, :data_timestamp,
         CASE WHEN CAST(:span_lo AS timestamptz) IS NULL THEN NULL
              ELSE tstzrange(CAST(:span_lo AS timestamptz),
                             CAST(:span_hi AS timestamptz), '[]') END,
-        :http_status, :duration_ms, :note, :raw_uri)
+        :http_status, :duration_ms, :note, :raw_uri, :raw_sha256)
 """)
 
 
@@ -92,7 +92,8 @@ def insert_fetch_run(engine: Engine, *, fetched_at: datetime, status: str,
                      record_count: int | None, data_timestamp: datetime | None,
                      span_lo: datetime | None, span_hi: datetime | None,
                      http_status: int | None, duration_ms: int | None,
-                     note: str | None, raw_uri: str | None = None) -> None:
+                     note: str | None, raw_uri: str | None = None,
+                     raw_sha256: str | None = None) -> None:
     """★★ 每次執行都要寫一筆，失敗也要寫。
 
     少了它，這支爬蟲在「資料健康」頁面上等於不存在——而且因為前端有退回機制，
@@ -103,6 +104,7 @@ def insert_fetch_run(engine: Engine, *, fetched_at: datetime, status: str,
         'record_count': record_count, 'data_timestamp': data_timestamp,
         'span_lo': span_lo, 'span_hi': span_hi, 'http_status': http_status,
         'duration_ms': duration_ms, 'note': note, 'raw_uri': raw_uri,
+        'raw_sha256': raw_sha256,
     }
     try:
         with engine.begin() as conn:

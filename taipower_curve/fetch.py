@@ -6,6 +6,7 @@
 """
 from dataclasses import dataclass
 from pathlib import Path
+import json
 import sys
 import time
 
@@ -24,8 +25,22 @@ REFERERS = {
     'loadfueltype.csv': _PAGE.format(10264),
     'loadareas.csv': _PAGE.format(10263),
     'genloadareaperc.csv': _PAGE.format(10264),
+    'loadpara.json': _PAGE.format(10264),
+}
+# 期望的內容形態。★ content-type 與內容都要驗：回 200 但吐挑戰頁（HTML）
+#   必須當成失敗，不是「今天沒資料」。
+EXPECTED = {
+    'loadfueltype.csv': 'csv',
+    'loadareas.csv': 'csv',
+    'genloadareaperc.csv': 'csv',
+    'loadpara.json': 'json',
 }
 FILES = list(REFERERS)
+
+
+def source_url(name: str) -> str:
+    """抓下來的資料要帶原始網址（平台紀律），歸檔與 fetch_run 都用這個。"""
+    return f'{BASE}/{name}'
 
 
 class FetchError(Exception):
@@ -92,18 +107,46 @@ def fetch_one(session: requests.Session, name: str, user_agent: str,
         raise FetchError(f'{name}: HTTP {r.status_code}'
                          '（很可能是這台機器的出口 IP 被 CloudFront 擋了）',
                          http_status=r.status_code)
-    # ★ 只看狀態碼會被騙：官網回 200 但內容是 CloudFront 403 HTML 是踩過的坑。
-    if b'<html' in r.content[:400].lower():
-        raise FetchError(f'{name}: HTTP 200 但內容是 HTML 不是 CSV'
-                         '（CloudFront 擋頁，這是靜默失敗的典型長相）',
-                         http_status=r.status_code)
-    if not r.content.strip():
-        raise FetchError(f'{name}: 回應是空的', http_status=r.status_code)
+    _validate(name, r)
     return r.content
 
 
+def _validate(name: str, r: requests.Response) -> None:
+    """★ 空回應／挑戰頁不等於「今天沒資料」，一律當失敗。
+
+    content-type 與內容都要驗——只看其中一個都會被騙：
+      - 只看狀態碼：CloudFront 擋頁是 HTTP 200 + HTML（踩過的坑）
+      - 只看 content-type：擋頁有時仍標成 text/csv
+    """
+    kind = EXPECTED[name]
+    ctype = (r.headers.get('content-type') or '').lower()
+    head = r.content[:400].lstrip().lower()
+
+    if not r.content.strip():
+        raise FetchError(f'{name}: 回應是空的（不等於今天沒資料）',
+                         http_status=r.status_code)
+    if 'html' in ctype or head.startswith(b'<!doctype') or b'<html' in head:
+        raise FetchError(
+            f'{name}: HTTP 200 但內容是 HTML（content-type={ctype or "無"}）'
+            '——挑戰頁／擋頁，這是靜默失敗的典型長相',
+            http_status=r.status_code)
+    if kind == 'json':
+        if 'json' not in ctype and not head.startswith((b'{', b'[')):
+            raise FetchError(f'{name}: 期望 JSON，content-type={ctype or "無"}、'
+                             f'開頭是 {r.content[:40]!r}', http_status=r.status_code)
+        try:
+            json.loads(r.content.decode('utf-8-sig'))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise FetchError(f'{name}: content-type 是 JSON 但解不開——{exc}',
+                             http_status=r.status_code) from None
+    else:                                   # csv
+        if 'json' in ctype:
+            raise FetchError(f'{name}: 期望 CSV 卻拿到 {ctype}',
+                             http_status=r.status_code)
+
+
 def fetch_all(user_agent: str, delay: float = 1.0) -> FetchResult:
-    """抓三支檔。★ 每次執行只打 3 個請求、之間 sleep，不做重試風暴。"""
+    """抓四支檔。★ 每次執行只打 4 個請求、之間 sleep，不做重試風暴。"""
     session = make_session()
     bodies: dict[str, bytes] = {}
     errors: dict[str, str] = {}
