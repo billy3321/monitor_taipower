@@ -94,14 +94,22 @@ def _run(cfg: dict, now: datetime, started: float) -> tuple[str, int, int]:
         log.warning('原文歸檔失敗（不影響寫入）：%s — %s', type(exc).__name__, exc)
         errors += 1
 
-    # ── 3. 解析 ──────────────────────────────────────────────────
-    b = result.bodies
-    try:
-        points = P.parse_all(b.get('loadfueltype.csv'), b.get('loadareas.csv'),
-                             b.get('genloadareaperc.csv'), b.get('loadpara.json'))
-    except P.ParseError as exc:
-        # 欄數不符＝來源改版。寧可整次失敗也不要猜著對寫進錯的標籤。
-        log.error('解析失敗（來源可能改版，欄位對應要人工重新驗證）：%s', exc)
+    # ── 3. 解析（逐檔隔離：單檔解析失敗 ≈ 該檔沒抓到，其他照常）────
+    points, parse_errors = P.parse_files(result.bodies)
+    for why in parse_errors:
+        # 欄數不符＝來源改版。該檔寧可失敗也不要猜著對寫進錯的標籤。
+        log.error('解析失敗（來源可能改版，欄位對應要人工重新驗證）：%s', why)
+        errors += 1
+        note_parts.append(why.split('：')[0])
+
+    # ── 3.5 跨午夜防線：未來的點一律整批拒寫 ─────────────────────
+    #   慢速抓取跨過 00:00 時檔案可能已換日重置，舊日資料會被 perc 的
+    #   新日期標成「未來」。這批寫進去會變成掛在圖上的整天假資料。
+    future = P.find_future_points(points, now)
+    if future:
+        log.error('出現 %d 個未來時點（最遠 %s）——疑似跨午夜抓到換日中的檔案，'
+                  '這次整批不寫入', len(future),
+                  max(p.observed_at for p in future))
         errors += 1
         points = []
 

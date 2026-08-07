@@ -17,7 +17,7 @@
 dashboard-app 只負責讀取顯示。
 
 ★ 專案已經實作完成並在跑（2026-08-05 上線）。接手時要改東西，先跑
-`./venv/bin/pytest -q`（73 條）與 `scripts/verify_fixtures.py` 確認基準線是綠的，
+`./venv/bin/pytest -q`（82 條）與 `scripts/verify_fixtures.py` 確認基準線是綠的，
 改完再跑一次。**負向對照**（見「測試」節）不是選配。
 
 ## ★★ 欄位對應：這是本專案最容易錯的地方
@@ -259,6 +259,25 @@ curl -X DELETE "http://<pushgateway>/metrics/job/monitor_taipower_curve/instance
 
 所以用 `StartCalendarInterval` 對齊時鐘：每小時 `:55`，再加一次 `23:59` 收尾。
 請求量幾乎不變（25 次/日 vs 24 次/日）。見 `deployment/*.plist`。
+（launchd 的 StartCalendarInterval 跟著**系統時區**跑，這台機器必須是
+Asia/Taipei——`readlink /etc/localtime` 驗證。）
+
+### ★ 跨午夜防線：未來的點一律整批拒寫
+
+23:59 那次若遇上慢網路（單一請求 timeout 25 秒），抓取可能跨過 00:00：
+fuel 抓到舊日滿檔、之後的 genloadareaperc 已換日——日期基準取自後者，
+舊日 23:50 會被標成**新一天的 23:50**，整天份的假資料寫進圖裡，
+再被之後的執行一小時一小時慢慢蓋掉。
+
+所以 `run_once` 在解析後檢查 `find_future_points()`：任何一點超過
+now＋20 分鐘就**整批拒寫**（23:55 那次已把舊日收乾淨，丟掉這批零損失）。
+容忍值 20 分鐘：要放得過正常發布延遲，也要抓得住錯標一天的資料。
+
+### 已知的接受風險：23:50 那個點賭的是發布延遲 ≤ 9 分鐘
+
+實測發布延遲 5–11 分鐘。23:59 收尾時 23:50 的點需要延遲 ≤9 分鐘才拿得到；
+超過就只能放掉那一個點（不能再往後排——檔案 00:00 換日，之後抓到的
+就是新天的檔，防線也會把它擋下）。實測 08-05、08-06 兩天都是完整 144 點。
 
 ## 資料表
 
@@ -307,7 +326,7 @@ naive datetime 進到 `timestamptz` 欄位，資料庫會拿連線的 `TimeZone`
 
 ## 測試
 
-現有 73 條（`./venv/bin/pytest -q`）。動到解析或抓取就要跑，而且至少要保住這幾條：
+現有 82 條（`./venv/bin/pytest -q`）。動到解析或抓取就要跑，而且至少要保住這幾條：
 
 1. 欄位對應（用 fixture，斷言燃氣/太陽能/風力等對到正確的值）
 2. **兩支曲線總和吻合**的交叉測試 ← 最有價值的一條
@@ -334,6 +353,8 @@ naive datetime 進到 `timestamptz` 欄位，資料庫會拿連線的 `TimeZone`
 | 拿掉 content-type 檢查 | HTML 挑戰頁 |
 | `TAIPEI` 改回 `timezone(timedelta(hours=8))` | IANA 時區那兩條 |
 | `astimezone(TAIPEI)` 改回裸 `astimezone()` | 歸檔不依賴機器時區那條 |
+| 逐檔隔離改回一鍋端 | 壞 perc 不可拖垮曲線那條 |
+| 未來時點容忍值改成無限大 | 跨午夜錯標那條 |
 
 ★ 做負向對照時如果「改壞了測試卻還是綠的」，先確認不是 **Python bytecode 快取**
 在騙你：改回去的檔案若**大小相同且在同一秒內寫入**，`.pyc` 的 (mtime, size)

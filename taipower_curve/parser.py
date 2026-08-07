@@ -4,7 +4,7 @@
 並用兩支曲線總和交叉驗證過）。改動這裡的欄位對應時 PARSER_VERSION 要跟著改。
 """
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 import csv
 import io
@@ -246,31 +246,85 @@ def taipei_today() -> date:
     return datetime.now(TAIPEI).date()
 
 
-def parse_all(fuel_body: bytes | None, area_body: bytes | None,
-              perc_body: bytes | None,
-              loadpara_body: bytes | None = None) -> list[Point]:
-    """四支檔 → 全部 Point。任一支缺（沒抓到）就跳過那一支。"""
+def parse_files(bodies: dict[str, bytes]) -> tuple[list[Point], list[str]]:
+    """四支檔各自解析，**單檔失敗不拖垮其他檔**——與抓取失敗同一條原則：
+    解析失敗的檔 ≈ 沒抓到的檔，跳過它、記一筆錯誤、其他檔照常處理。
+
+    ★ 這是正式執行路徑用的。一個大 try 包住全部的寫法踩過的坑：
+      loadpara.json 哪天改個欄位，連好好的 fuel/area 曲線都一起陪葬。
+
+    回 (points, 錯誤訊息列表)。錯誤列表非空時呼叫端要把它變成可見失敗。
+    """
+    points: list[Point] = []
+    errors: list[str] = []
+
     perc_points: list[Point] = []
     base_date: date | None = None
-    if perc_body is not None:
-        perc_points, base_date = parse_areaperc(perc_body)
+    if 'genloadareaperc.csv' in bodies:
+        try:
+            perc_points, base_date = parse_areaperc(bodies['genloadareaperc.csv'])
+        except ParseError as exc:
+            errors.append(f'genloadareaperc.csv 解析失敗：{exc}')
     if base_date is None:
         base_date = taipei_today()
 
-    points: list[Point] = []
-    if fuel_body is not None:
-        points += parse_curve(fuel_body, 'fuel', FUEL_COLUMNS, base_date)
-    if area_body is not None:
-        points += parse_curve(area_body, 'area', AREA_COLUMNS, base_date)
+    for name, kind, cols in (('loadfueltype.csv', 'fuel', FUEL_COLUMNS),
+                             ('loadareas.csv', 'area', AREA_COLUMNS)):
+        if name not in bodies:
+            continue
+        try:
+            points += parse_curve(bodies[name], kind, cols, base_date)
+        except ParseError as exc:
+            errors.append(f'{name} 解析失敗：{exc}')
     points += perc_points
 
-    if loadpara_body is not None:
-        # loadpara 沒有自己的時戳，掛在曲線最新的時點上（見 parse_loadpara）
-        curve_times = [p.observed_at for p in points if p.kind == 'fuel']
-        if curve_times:
-            points += parse_loadpara(loadpara_body, max(curve_times))
-        # 沒有曲線就沒有可信的時戳可掛——寧可不寫，也不要自己編一個時間
+    if 'loadpara.json' in bodies:
+        # loadpara 沒有自己的時戳，掛在曲線最新的時點上（見 parse_loadpara）。
+        # 沒有能源別曲線就沒有可信的時戳可掛，也做不了 capacity 交叉檢查——
+        # 寧可不寫，也不要自己編一個時間。
+        fuel_times = [p.observed_at for p in points if p.kind == 'fuel']
+        if fuel_times:
+            try:
+                points += parse_loadpara(bodies['loadpara.json'], max(fuel_times))
+            except ParseError as exc:
+                errors.append(f'loadpara.json 解析失敗：{exc}')
+    return points, errors
+
+
+def parse_all(fuel_body: bytes | None, area_body: bytes | None,
+              perc_body: bytes | None,
+              loadpara_body: bytes | None = None) -> list[Point]:
+    """嚴格版：四支檔 → 全部 Point，任何一支解析失敗就丟例外。
+
+    給測試與驗收腳本用。正式執行路徑用 parse_files()——單檔失敗要隔離。
+    """
+    bodies = {name: body for name, body in (
+        ('loadfueltype.csv', fuel_body), ('loadareas.csv', area_body),
+        ('genloadareaperc.csv', perc_body), ('loadpara.json', loadpara_body),
+    ) if body is not None}
+    points, errors = parse_files(bodies)
+    if errors:
+        raise ParseError('; '.join(errors))
     return points
+
+
+# 跨午夜防線的容忍值：台電發布延遲 7–11 分鐘，正常情況最新點永遠在過去。
+FUTURE_TOLERANCE = timedelta(minutes=20)
+
+
+def find_future_points(points: list[Point], now: datetime) -> list[Point]:
+    """回「在未來」的點——正常情況必為空。
+
+    ★ 什麼時候會非空：慢速抓取**跨過午夜**時。fuel 抓到的是舊日滿檔、
+      之後抓的 genloadareaperc 已換日，日期基準取自後者，舊日的 23:50
+      就會被標成新一天的 23:50——那是快 24 小時後的未來。寫進去的話，
+      整天份的假資料會躺在圖上，等著被之後的執行一小時一小時慢慢蓋掉。
+
+    呼叫端看到非空就該整批拒寫：23:55 那次已經把舊日收乾淨了，
+    這一批丟掉沒有損失。
+    """
+    cutoff = now + FUTURE_TOLERANCE
+    return [p for p in points if p.observed_at > cutoff]
 
 
 def totals_at(points: list[Point], kind: str,
