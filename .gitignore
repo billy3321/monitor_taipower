@@ -1,8 +1,34 @@
+# ── 機密（絕不進 git）─────────────────────────────────────────
+# 資料庫密碼
 config/config.yml
-config/ssl/*.pem
-venv/
-.DS_Store
-__pycache__/
-*.pyc
-.pytest_cache/
+# Cloud SQL client certificate 與私鑰。
+# ★ 用 * 不用 *.pem：哪天憑證換成 .key/.crt 副檔名，也不能漏進 git。
+config/ssl/*
+!config/ssl/.gitkeep
+
+# ── 本機資料 ─────────────────────────────────────────────────
+# 原文歸檔（data/raw/，90 天滾動，見 README）
 data/
+# 本機日誌（正式日誌在 /tmp/taipower-curve.log，這裡防手動重導向誤留）
+*.log
+# README 的交付流程會在根目錄產生 git bundle
+*.bundle
+
+# ── Python ──────────────────────────────────────────────────
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ── macOS ───────────────────────────────────────────────────
+.DS_Store
+
+# ── 編輯器 ───────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
