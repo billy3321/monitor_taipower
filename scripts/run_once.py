@@ -134,18 +134,24 @@ def _run(cfg: dict, now: datetime, started: float) -> tuple[str, int, int]:
             else:
                 log.info('交叉檢查通過：%s 兩邊總和差 %.0f MW', t, diff)
 
-    # loadpara 的即時用電 vs 同時點能源別合計（驗時點掛對了沒有）
-    cap = P.cross_check_capacity(points)
-    if cap is not None:
-        curr, ftot = cap
-        diff = abs(curr - ftot)
-        if diff >= P.CAPACITY_CHECK_TOLERANCE_MW:
-            log.error('即時用電 %.0f MW 與同時點能源別合計 %.0f MW 差 %.0f——'
-                      'loadpara 與曲線不同步，這次不寫 capacity', curr, ftot, diff)
+    # loadpara 的即時用電 vs 能源別合計（驗時點掛對了沒有）。
+    # loadpara 偶爾比曲線慢一格，rehome 會往回找吻合的時點改掛——
+    # 慢一格不算錯；連往回找都找不到才是真的不同步。
+    if any(p.kind == 'capacity' for p in points):
+        orig_anchor = next(p.observed_at for p in points if p.kind == 'capacity')
+        rehomed = P.rehome_capacity(points)
+        if rehomed is None:
+            log.error('即時用電對不上最近幾個時點的能源別合計——loadpara 與曲線'
+                      '真的不同步（不只是慢一格），這次不寫 capacity')
             errors += 1
             points = [p for p in points if p.kind != 'capacity']
         else:
-            log.info('即時供電檢查通過：即時用電與能源別合計差 %.0f MW', diff)
+            points, anchored_at, diff = rehomed
+            if anchored_at != orig_anchor:
+                log.info('即時供電檢查：loadpara 慢曲線一格，capacity 改掛 %s'
+                         '（該時點差 %.0f MW）', anchored_at, diff)
+            else:
+                log.info('即時供電檢查通過：即時用電與能源別合計差 %.0f MW', diff)
 
     # ── 5. 寫入 ──────────────────────────────────────────────────
     kinds = {p.kind for p in points}

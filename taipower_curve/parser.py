@@ -3,7 +3,7 @@
 欄序來源見 CLAUDE.md（2026-08-05 從官網現行 JS 分支的 balloon 文字逆向、
 並用兩支曲線總和交叉驗證過）。改動這裡的欄位對應時 PARSER_VERSION 要跟著改。
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 import csv
@@ -220,6 +220,44 @@ def parse_loadpara(body: bytes, observed_at: datetime) -> list[Point]:
         # ★ 欄位消失＝來源改版，要看得見。已取到的照樣回傳，不要整批丟掉。
         raise ParseError(f'loadpara.json 缺少預期欄位 {missing}（來源可能改版了）')
     return points
+
+
+def rehome_capacity(points: list[Point], max_back: int = 2
+                    ) -> tuple[list[Point], datetime, float] | None:
+    """把 capacity 掛到「即時用電＝能源別合計」成立的時點上。
+
+    ★ 為什麼需要：loadpara 偶爾比曲線**慢一個 10 分鐘檔**。2026-08-10 實測：
+      曲線已出 09:30（合計 36,545 MW），loadpara 的即時用電 36,083 還是
+      09:20 的值（該時點合計 36,084，差 1 MW）——早上爬升時段一格就差
+      462 MW，掛在最新時點會被容忍值正確地擋下，但那個小時的 capacity
+      就丟了。慢一格不是錯誤，掛回正確的時點就好。
+
+    從曲線最新時點往回最多 max_back 格找吻合（差 < CAPACITY_CHECK_TOLERANCE_MW）
+    的時點；夜間負載平坦時多個時點都吻合，取**最新**的那個（loadpara 是
+    「當下」的值）。
+
+    回 (改掛後的 points, 掛載時點, 差值)；都對不上回 None——那不是慢一格，
+    是真的不同步（來源改版、單位錯），呼叫端要丟掉 capacity 並記錯誤。
+    ★ 即時用電本身是 None（未報告）時也回 None：驗不了時點的 capacity
+      寧可不寫，不要掛在猜的時間上。
+    """
+    curr = next((p for p in points
+                 if p.kind == 'capacity' and p.label == '即時用電'
+                 and p.mw is not None), None)
+    if curr is None:
+        return None
+    fuel_times = sorted({p.observed_at for p in points if p.kind == 'fuel'})
+    for t in reversed(fuel_times[-(max_back + 1):]):
+        total = totals_at(points, 'fuel', t)
+        if total is None:
+            continue
+        diff = abs(curr.mw - total)
+        if diff < CAPACITY_CHECK_TOLERANCE_MW:
+            if t == curr.observed_at:
+                return points, t, diff
+            return ([replace(p, observed_at=t) if p.kind == 'capacity' else p
+                     for p in points], t, diff)
+    return None
 
 
 def cross_check_capacity(points: list[Point]) -> tuple[float, float] | None:

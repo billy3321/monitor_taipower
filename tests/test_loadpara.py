@@ -132,3 +132,71 @@ def test_no_curve_means_no_capacity_points():
     """★ 沒有曲線就沒有可信的時戳可掛——寧可不寫，也不要自己編一個時間。"""
     pts = P.parse_all(None, None, None, read('loadpara.json'))
     assert [p for p in pts if p.kind == 'capacity'] == []
+
+
+# ── rehome：loadpara 慢曲線一格時改掛正確時點 ────────────────────
+
+def _fuel(t, total):
+    return P.Point(t, 'fuel', '燃氣', total)
+
+
+def _capacity(t, curr):
+    return [P.Point(t, 'capacity', '即時用電', curr),
+            P.Point(t, 'capacity', '即時供電能力', 49879.0)]
+
+
+def _t(hh, mm):
+    return datetime(2026, 8, 10, hh, mm, tzinfo=P.TAIPEI)
+
+
+def test_rehome_keeps_anchor_when_in_sync():
+    pts = [_fuel(_t(9, 20), 36084.0), _fuel(_t(9, 30), 36545.0),
+           *_capacity(_t(9, 30), 36545.0)]
+    out, anchored, diff = P.rehome_capacity(pts)
+    assert anchored == _t(9, 30)
+    assert diff == 0.0
+    assert out == pts, '同步時不該動任何東西'
+
+
+def test_rehome_moves_capacity_one_slot_back():
+    """★ 重現 2026-08-10 09:32 事故：loadpara 還是 09:20 的值（36083），
+    曲線已出 09:30（36545）。改掛 09:20 而不是丟掉。"""
+    pts = [_fuel(_t(9, 20), 36084.0), _fuel(_t(9, 30), 36545.0),
+           *_capacity(_t(9, 30), 36083.0)]
+    out, anchored, diff = P.rehome_capacity(pts)
+    assert anchored == _t(9, 20)
+    assert diff == 1.0
+    cap_times = {p.observed_at for p in out if p.kind == 'capacity'}
+    assert cap_times == {_t(9, 20)}, 'capacity 全部點都要跟著改掛'
+    fuel_times = {p.observed_at for p in out if p.kind == 'fuel'}
+    assert fuel_times == {_t(9, 20), _t(9, 30)}, '曲線不可以被動到'
+
+
+def test_rehome_prefers_latest_when_flat():
+    """夜間負載平坦時多個時點都吻合——取最新的（loadpara 是當下的值）。"""
+    pts = [_fuel(_t(2, 0), 25000.0), _fuel(_t(2, 10), 25010.0),
+           *_capacity(_t(2, 10), 25005.0)]
+    _, anchored, _ = P.rehome_capacity(pts)
+    assert anchored == _t(2, 10)
+
+
+def test_rehome_gives_up_beyond_max_back():
+    """慢超過 max_back 格＝真的不同步，回 None 讓呼叫端丟掉並記錯誤。"""
+    pts = [_fuel(_t(9, 0), 35274.0), _fuel(_t(9, 10), 36092.0),
+           _fuel(_t(9, 20), 36084.0), _fuel(_t(9, 30), 36545.0),
+           *_capacity(_t(9, 30), 35274.0)]           # 只跟三格前的 09:00 吻合
+    assert P.rehome_capacity(pts, max_back=2) is None
+
+
+def test_rehome_gives_up_when_nothing_matches():
+    pts = [_fuel(_t(9, 20), 36084.0), _fuel(_t(9, 30), 36545.0),
+           *_capacity(_t(9, 30), 99999.0)]
+    assert P.rehome_capacity(pts) is None
+
+
+def test_rehome_refuses_when_curr_load_unreported():
+    """即時用電是 None 時驗不了時點——寧可不寫，不要掛在猜的時間上。"""
+    pts = [_fuel(_t(9, 30), 36545.0),
+           P.Point(_t(9, 30), 'capacity', '即時用電', None),
+           P.Point(_t(9, 30), 'capacity', '即時供電能力', 49879.0)]
+    assert P.rehome_capacity(pts) is None
