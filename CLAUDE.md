@@ -363,7 +363,7 @@ naive datetime 進到 `timestamptz` 欄位，資料庫會拿連線的 `TimeZone`
 
 ## 監控回報標準（五個爬蟲專案一致，2026-08-11 立）
 
-**唯一事實來源**：`crawlers/unified_api_and_communication_standard.md`
+**唯一事實來源**：`crawlers/monitoring_platform/docs/unified_api_and_communication_standard.md`
 （Telemetry Standard v2）。動監控相關的東西前先看那份，不要各自發明。
 
 這支專案必須做到：
