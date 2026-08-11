@@ -366,3 +366,37 @@ naive datetime 進到 `timestamptz` 欄位，資料庫會拿連線的 `TimeZone`
 在騙你：改回去的檔案若**大小相同且在同一秒內寫入**，`.pyc` 的 (mtime, size)
 驗證會判定快取仍有效而沿用舊 bytecode。踩過一次。先
 `find . -name __pycache__ -exec rm -rf {} +` 再跑。
+
+## 監控回報標準（五個爬蟲專案一致，2026-08-11 立）
+
+**唯一事實來源**：`crawlers/monitoring_platform/docs/unified_api_and_communication_standard.md`
+（Telemetry Standard v2）。動監控相關的東西前先看那份，不要各自發明。
+
+這支專案必須做到：
+
+1. **每次跑完都推 `scrapy_last_run_timestamp_seconds`，只有成功才推
+   `scrapy_last_success_timestamp_seconds`**。存活告警看的是後者。
+2. **一律用 `pushadd_to_gateway`（POST），不可用 `push_to_gateway`（PUT）**。
+   PUT 是整組取代：失敗那次沒推 last_success，會把上次成功的紀錄一起洗掉，
+   告警從此永遠不燒（2026-08-05 五專案同修的教訓）。
+3. **`scrapy_items_unknown`：未知≠零**。抓失敗時筆數是「未知」，
+   推 0 會被讀成「來源真的沒東西」——這兩件事的意義完全相反。
+4. **`scrapy_max_stale_seconds`：把「自己多久沒成功算太舊」推上去**，
+   讓告警用這個數字，不要在告警檔另外寫死一個。
+   ★ 門檻寫兩份必定漂移：2026-08-11 台海情勢的告警寫死 26 小時，
+     而 17 個來源的容許時間比它長，結果**週一跑完、週二就開始告警，
+     一週 85% 的時間在喊狼來了**。
+5. **抓取健康紀錄（成功或失敗）一定要寫進 DB，而且不能跟資料同一個交易**。
+   ★ 2026-08-11 msil 事故：資料撞唯一鍵 → 整個交易 rollback →
+     連「我失敗了」那筆紀錄也被丟掉 → 健康頁顯示「昨天成功、狀態正常」。
+     **一個已經壞掉的來源，長得跟正常的一模一樣。**
+     做法：rollback 後另開交易補寫，並照樣推 telemetry（ok=False）。
+6. **一列寫不進去不要拖垮整批**。整批包一個 SAVEPOINT，整批失敗才退回逐列
+   （壞列跳過、好列照寫），失敗列數要寫進健康紀錄並把該次狀態降為 error。
+   救回來不等於沒事——靜默漏資料比整批失敗更危險。
+7. **改 spider 名稱＝同一個 PR 改告警規則**。
+   ★ 台海情勢改名後（facilities→pla_facilities 等），五條專屬告警規則
+     一條都對不上，全變成永遠不會燒的規則——那看起來跟一切正常一模一樣。
+
+參考實作：`monitor_strait_info/src/strait_info/fetchers/base.py`
+（`_record_failed_write` 與 `write_rows`）、`fetchers/telemetry.py`。
