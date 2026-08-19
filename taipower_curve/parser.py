@@ -67,9 +67,16 @@ NULL_TOKENS = {'', '-', '—', 'N/A', 'n/a', 'NA', 'null', 'NULL'}
 # 兩支曲線是同一份用電的兩種切分，同一時點總和必須吻合（實測差 1 MW）。
 CROSS_CHECK_TOLERANCE_MW = 50.0
 
-# loadpara 的即時用電 vs 同時點能源別合計（實測差 0 MW）。放寬到 100 MW 是為了
-# 容忍「loadpara 已更新到下一個 10 分鐘、曲線還沒」的短暫不同步。
+# loadpara 的即時用電 vs 同時點能源別合計（實測差 0 MW）。
+# 100 MW 是「嚴格吻合」：rehome 往回改掛時要求幾乎精確（實測 1、2、52 MW）。
 CAPACITY_CHECK_TOLERANCE_MW = 100.0
+
+# loadpara 有時比曲線最新一格更「新鮮」——它是即時值，CSV 是 10 分鐘切片，
+# 爬升時段兩者可以差上百 MW（2026-08-14 兩次實測都是 171 MW）。
+# 往回都找不到嚴格吻合、但最新格差距在此範圍內，就掛最新格：
+# 時間誤差 <10 分鐘且方向是「值比標籤新」，比丟掉整個小時的點好。
+# 不能再放寬：爬升時段相鄰兩格差 400–800 MW，300 仍分得出「新鮮」與「慢一格」。
+CAPACITY_FRESH_TOLERANCE_MW = 300.0
 
 
 class ParseError(Exception):
@@ -222,22 +229,24 @@ def parse_loadpara(body: bytes, observed_at: datetime) -> list[Point]:
     return points
 
 
-def rehome_capacity(points: list[Point], max_back: int = 2
+def rehome_capacity(points: list[Point], max_back: int = 6
                     ) -> tuple[list[Point], datetime, float] | None:
     """把 capacity 掛到「即時用電＝能源別合計」成立的時點上。
 
-    ★ 為什麼需要：loadpara 偶爾比曲線**慢一個 10 分鐘檔**。2026-08-10 實測：
-      曲線已出 09:30（合計 36,545 MW），loadpara 的即時用電 36,083 還是
-      09:20 的值（該時點合計 36,084，差 1 MW）——早上爬升時段一格就差
-      462 MW，掛在最新時點會被容忍值正確地擋下，但那個小時的 capacity
-      就丟了。慢一格不是錯誤，掛回正確的時點就好。
+    ★ 為什麼需要：loadpara 偶爾比曲線**慢**。2026-08-10 實測慢一格
+      （早上爬升時段一格差 462 MW）；2026-08-13 實測慢到**五格**
+      （18:55 抓到的值精確吻合 18:00 的合計，差 2 MW）。慢不是錯誤，
+      掛回值真正對應的時點就好——所以 max_back 預設 6（一小時）。
 
-    從曲線最新時點往回最多 max_back 格找吻合（差 < CAPACITY_CHECK_TOLERANCE_MW）
-    的時點；夜間負載平坦時多個時點都吻合，取**最新**的那個（loadpara 是
-    「當下」的值）。
+    兩段式判定，**嚴格優先**：
+      1. 從最新往回 max_back 格找嚴格吻合（< CAPACITY_CHECK_TOLERANCE_MW）。
+         夜間平坦時多格都吻合，取最新的（loadpara 是「當下」的值）。
+      2. 都沒有，但最新格差距 < CAPACITY_FRESH_TOLERANCE_MW → 掛最新格。
+         這是「loadpara 比 CSV 新鮮」的情況（2026-08-14 兩次實測 171 MW），
+         值介於最新格與下一格之間，時間誤差 <10 分鐘。
 
-    回 (改掛後的 points, 掛載時點, 差值)；都對不上回 None——那不是慢一格，
-    是真的不同步（來源改版、單位錯），呼叫端要丟掉 capacity 並記錯誤。
+    回 (改掛後的 points, 掛載時點, 差值)；兩段都對不上回 None——那是真的
+    不同步（來源改版、單位錯），呼叫端要丟掉 capacity 並記錯誤。
     ★ 即時用電本身是 None（未報告）時也回 None：驗不了時點的 capacity
       寧可不寫，不要掛在猜的時間上。
     """
@@ -247,16 +256,29 @@ def rehome_capacity(points: list[Point], max_back: int = 2
     if curr is None:
         return None
     fuel_times = sorted({p.observed_at for p in points if p.kind == 'fuel'})
+    if not fuel_times:
+        return None
+
+    def rehomed_at(t: datetime, diff: float):
+        if t == curr.observed_at:
+            return points, t, diff
+        return ([replace(p, observed_at=t) if p.kind == 'capacity' else p
+                 for p in points], t, diff)
+
     for t in reversed(fuel_times[-(max_back + 1):]):
         total = totals_at(points, 'fuel', t)
         if total is None:
             continue
         diff = abs(curr.mw - total)
         if diff < CAPACITY_CHECK_TOLERANCE_MW:
-            if t == curr.observed_at:
-                return points, t, diff
-            return ([replace(p, observed_at=t) if p.kind == 'capacity' else p
-                     for p in points], t, diff)
+            return rehomed_at(t, diff)
+
+    latest = fuel_times[-1]
+    total = totals_at(points, 'fuel', latest)
+    if total is not None:
+        diff = abs(curr.mw - total)
+        if diff < CAPACITY_FRESH_TOLERANCE_MW:
+            return rehomed_at(latest, diff)
     return None
 
 

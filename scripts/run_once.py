@@ -51,7 +51,7 @@ def main() -> int:
 
     # ★ 遙測一定要推——失敗也要推。沒有遙測 = 爬蟲死了沒人知道。
     if cfg is not None:
-        telemetry.push(cfg, run_ts=now.timestamp(), success=(status == 'ok'),
+        telemetry.push(cfg, run_ts=now.timestamp(), status=status,
                        items=items, errors=errors,
                        duration=time.monotonic() - started)
     else:
@@ -156,28 +156,52 @@ def _run(cfg: dict, now: datetime, started: float) -> tuple[str, int, int]:
     # ── 5. 寫入 ──────────────────────────────────────────────────
     kinds = {p.kind for p in points}
     curve_times = sorted({p.observed_at for p in points})
+    engine = db.make_engine(cfg)
+    items = 0
+    failed_rows = 0
+    write_failed = False
     try:
-        engine = db.make_engine(cfg)
-        items = db.upsert_points(engine, points, fetched_at=now)
-        if items:
-            counts = {k: sum(1 for p in points if p.kind == k) for k in sorted(kinds)}
-            log.info('已 upsert %d 筆（%s）', items,
-                     '; '.join(f'{k}={v}' for k, v in counts.items()))
-            note_parts.append('; '.join(f'{k}={v}' for k, v in counts.items()))
-        else:
-            note_parts.append('無資料')
+        items, failed_rows = db.upsert_points(engine, points, fetched_at=now)
+    except db.DatabaseError as exc:
+        # ★ 與「抓不到台電」是兩種完全不同的失敗，訊息已經在 DatabaseError 裡分好
+        log.error('%s', exc)
+        errors += 1
+        write_failed = True
+        note_parts.append('曲線寫入失敗')
+    if failed_rows:
+        # ★ 救回來不等於沒事：壞列數要看得見，該次狀態降為 error（標準 #6）
+        errors += 1
+        note_parts.append(f'壞列跳過 {failed_rows} 筆')
+    if items:
+        counts = {k: sum(1 for p in points if p.kind == k) for k in sorted(kinds)}
+        log.info('已 upsert %d 筆（%s）', items,
+                 '; '.join(f'{k}={v}' for k, v in counts.items()))
+        note_parts.append('; '.join(f'{k}={v}' for k, v in counts.items()))
+    elif not points:
+        note_parts.append('無資料')
 
-        if errors == 0 and items > 0:
-            status = 'ok'
-        elif errors == 0 and items == 0:
-            status = 'no_coverage'          # 抓到了但整天還沒有任何有值時點
-        else:
-            status = 'error'
+    if errors == 0 and items > 0:
+        status = 'ok'
+    elif errors == 0 and items == 0:
+        status = 'no_coverage'              # 抓到了但整天還沒有任何有值時點
+    else:
+        status = 'error'
 
-        # ★★ 每次執行都要寫一筆 fetch_run，失敗也要寫。
+    # record_count 的語意（寫錯會讓監控說謊）：寫入路徑有完成就是實際筆數
+    # （含 no_coverage 的 0 與逐列退回的部分筆數）；抓/解析失敗到沒東西可寫、
+    # 或寫入本身失敗 → NULL（筆數未知，不是 0）。
+    if write_failed or (status == 'error' and not points):
+        record_count = None
+    else:
+        record_count = items
+
+    # ★★ 每次執行都要寫一筆 fetch_run，失敗也要寫——而且**與資料不同交易**
+    #    （標準 #5，msil 教訓）：資料那筆交易 rollback 時，「我失敗了」這筆
+    #    紀錄不能陪葬，否則壞掉的來源在健康頁上長得跟正常的一模一樣。
+    try:
         db.insert_fetch_run(
             engine, fetched_at=now, status=status,
-            record_count=items if points or status != 'error' else None,
+            record_count=record_count,
             data_timestamp=curve_times[-1] if curve_times else None,
             span_lo=curve_times[0] if curve_times else None,
             span_hi=curve_times[-1] if curve_times else None,
@@ -185,10 +209,9 @@ def _run(cfg: dict, now: datetime, started: float) -> tuple[str, int, int]:
             duration_ms=int((time.monotonic() - started) * 1000),
             note='; '.join(note_parts)[:500],
             raw_uri=raw_uri, raw_sha256=raw_sha)
-        log.info('fetch_run 已記錄：status=%s record_count=%s', status, items)
+        log.info('fetch_run 已記錄：status=%s record_count=%s', status, record_count)
     except db.DatabaseError as exc:
-        # ★ 與「抓不到台電」是兩種完全不同的失敗，訊息已經在 DatabaseError 裡分好
-        log.error('%s', exc)
+        log.error('fetch_run 寫不進去（健康頁會看不到這次執行）：%s', exc)
         errors += 1
         status = 'error'
     return status, items, errors

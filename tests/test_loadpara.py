@@ -200,3 +200,41 @@ def test_rehome_refuses_when_curr_load_unreported():
            P.Point(_t(9, 30), 'capacity', '即時用電', None),
            P.Point(_t(9, 30), 'capacity', '即時供電能力', 49879.0)]
     assert P.rehome_capacity(pts) is None
+
+
+def test_rehome_reaches_five_slots_back():
+    """★ 重現 2026-08-13 18:55 事故：loadpara 落後五格（值精確吻合 18:00，
+    差 2 MW），max_back 預設要搆得到。"""
+    pts = [_fuel(_t(18, 0), 37542.0), _fuel(_t(18, 10), 37321.0),
+           _fuel(_t(18, 20), 37390.0), _fuel(_t(18, 30), 37418.0),
+           _fuel(_t(18, 40), 37306.0), _fuel(_t(18, 50), 37369.0),
+           *_capacity(_t(18, 50), 37540.0)]
+    out, anchored, diff = P.rehome_capacity(pts)
+    assert anchored == _t(18, 0)
+    assert diff == 2.0
+
+
+def test_rehome_accepts_fresher_loadpara_at_latest_slot():
+    """★ 重現 2026-08-14 06:55/07:55 事故：loadpara 比 CSV 新鮮，
+    吻合最新格但差 171 MW——往回全都對不上時，用新鮮側容忍掛最新格。"""
+    pts = [_fuel(_t(7, 40), 31230.0), _fuel(_t(7, 50), 31846.0),
+           *_capacity(_t(7, 50), 32017.0)]           # 差 171
+    out, anchored, diff = P.rehome_capacity(pts)
+    assert anchored == _t(7, 50)
+    assert diff == 171.0
+
+
+def test_rehome_strict_match_beats_fresh_acceptance():
+    """嚴格吻合（舊格）優先於新鮮側容忍（最新格）：值精確對上哪裡就掛哪裡。"""
+    pts = [_fuel(_t(18, 0), 37542.0), _fuel(_t(18, 50), 37369.0),
+           *_capacity(_t(18, 50), 37540.0)]          # 最新格差 171、18:00 差 2
+    _, anchored, diff = P.rehome_capacity(pts)
+    assert anchored == _t(18, 0)
+    assert diff == 2.0
+
+
+def test_rehome_fresh_tolerance_has_a_ceiling():
+    """新鮮側容忍不是無上限：差到一格的量級（400+）就不能當「新鮮」。"""
+    pts = [_fuel(_t(7, 40), 31230.0), _fuel(_t(7, 50), 31846.0),
+           *_capacity(_t(7, 50), 32250.0)]           # 差 404
+    assert P.rehome_capacity(pts) is None

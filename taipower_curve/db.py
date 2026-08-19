@@ -71,10 +71,18 @@ def make_engine(cfg: dict) -> Engine:
 
 
 def upsert_points(engine: Engine, points: list[Point],
-                  fetched_at: datetime) -> int:
-    """整批 upsert，包在單一 transaction——★ 不可半寫入，失敗就整批 rollback。"""
+                  fetched_at: datetime) -> tuple[int, int]:
+    """整批 upsert。回 (寫入筆數, 跳過的壞列數)。
+
+    ★ 標準 #6：一列寫不進去不要拖垮整批。先走整批（單一交易，最快），
+      整批失敗才退回逐列——每列包 SAVEPOINT，壞列跳過、好列照寫。
+      呼叫端看到壞列數 >0 要把該次狀態降為 error 並寫進健康紀錄：
+      **救回來不等於沒事**，靜默漏資料比整批失敗更危險。
+
+    兩條路都全滅（例如連線根本建不起來）才丟 DatabaseError。
+    """
     if not points:
-        return 0
+        return 0, 0
     from .parser import PARSER_VERSION
     rows = [(p.observed_at, p.kind, p.label, p.mw, PARSER_VERSION, fetched_at)
             for p in points]
@@ -82,10 +90,31 @@ def upsert_points(engine: Engine, points: list[Point],
         with engine.begin() as conn:       # begin() = 成功才 commit，例外自動 rollback
             execute_values(conn.connection.cursor(), _UPSERT_CURVE, rows,
                            page_size=500)
+        return len(rows), 0
     except Exception as exc:
         # raw cursor 丟的是 psycopg2 原生例外，不是 SQLAlchemy 包裝的
+        log.warning('整批 upsert 失敗（%s — %s），退回逐列寫入',
+                    type(exc).__name__, str(exc)[:150])
+
+    written = failed = 0
+    try:
+        with engine.begin() as conn:
+            cur = conn.connection.cursor()
+            for row in rows:
+                cur.execute('SAVEPOINT row_sp')
+                try:
+                    execute_values(cur, _UPSERT_CURVE, [row])
+                    cur.execute('RELEASE SAVEPOINT row_sp')
+                    written += 1
+                except Exception as exc:
+                    cur.execute('ROLLBACK TO SAVEPOINT row_sp')
+                    failed += 1
+                    if failed <= 3:        # 全列印會刷爆日誌，前三筆夠定位
+                        log.error('壞列跳過 %r：%s', row[:3], str(exc)[:150])
+    except Exception as exc:
         raise DatabaseError(_permission_hint(exc)) from exc
-    return len(rows)
+    log.warning('逐列退回結果：寫入 %d、跳過 %d', written, failed)
+    return written, failed
 
 
 def insert_fetch_run(engine: Engine, *, fetched_at: datetime, status: str,

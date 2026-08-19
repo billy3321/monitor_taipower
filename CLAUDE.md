@@ -17,7 +17,7 @@
 dashboard-app 只負責讀取顯示。
 
 ★ 專案已經實作完成並在跑（2026-08-05 上線）。接手時要改東西，先跑
-`./venv/bin/pytest -q`（88 條）與 `scripts/verify_fixtures.py` 確認基準線是綠的，
+`./venv/bin/pytest -q`（99 條）與 `scripts/verify_fixtures.py` 確認基準線是綠的，
 改完再跑一次。**負向對照**（見「測試」節）不是選配。
 
 ## ★★ 欄位對應：這是本專案最容易錯的地方
@@ -121,10 +121,17 @@ dashboard-app 只負責讀取顯示。
 同時點的能源別合計（實測差 0 MW）。它同時證明了「把 loadpara 掛在曲線最新時點」
 這個做法是對的——那個檔沒有自己的時戳。
 
-★ loadpara 偶爾比曲線**慢一個 10 分鐘檔**（2026-08-10 實測：早上爬升時段
-一格差 462 MW）。`rehome_capacity` 會往回最多兩格找「即時用電＝合計」成立的
-時點改掛——慢一格不算錯，掛回正確時點就好；連往回找都找不到才丟 capacity
-並記錯誤。夜間平坦時多格都吻合，取最新的。
+★ loadpara 與曲線的時間對位有兩種偏差，`rehome_capacity` 兩段式處理（嚴格優先）：
+
+- **慢**：2026-08-10 實測慢一格（爬升時段差 462 MW）、2026-08-13 實測慢**五格**
+  （值精確吻合 18:00，差 2 MW）。往回最多六格找嚴格吻合（<100 MW）改掛；
+  夜間平坦多格吻合取最新。
+- **快（更新鮮）**：loadpara 是即時值、CSV 是 10 分鐘切片，2026-08-14 兩次實測
+  吻合最新格但差 171 MW。往回全對不上而最新格差 <300 MW 就掛最新格
+  （時間誤差 <10 分鐘，方向是值比標籤新）。300 不能再放寬：爬升時段相鄰
+  兩格差 400–800 MW，要分得出「新鮮」與「慢一格」。
+
+兩段都對不上才丟 capacity 並記錯誤——那是真的不同步（來源改版、單位錯）。
 
 ## 紀律（家族共通，違反過的都在這裡）
 
@@ -219,7 +226,10 @@ JSON 端點要真的 `json.loads` 得起來才算成功。見 `fetch._validate()
 - `grouping_key = {instance_id, spider}`，spider 用 `loadcurve`
 - 指標：`scrapy_last_run_timestamp_seconds`（每次都設）、
   `scrapy_last_success_timestamp_seconds`（**僅成功時設**）、
-  `scrapy_items_scraped`、`scrapy_log_errors`、`scrapy_run_duration_seconds`
+  `scrapy_items_scraped`（**筆數可信時才設**——error 且零寫入時筆數是未知，
+  改推 `scrapy_items_unknown=1`，不推 0）、`scrapy_items_unknown`、
+  `scrapy_log_errors`、`scrapy_run_duration_seconds`、
+  `scrapy_max_stale_seconds`（=10800，告警用這個數字，不要另外寫死一份）
 - 全部是 gauge、單一 `scrapy_` 前綴、無 `_total`
 - 推送失敗只 WARNING 不中斷爬蟲，timeout 5 秒
 - URL 從 `config.yml` 的 `monitoring.pushgateway.url` 讀
@@ -331,7 +341,7 @@ naive datetime 進到 `timestamptz` 欄位，資料庫會拿連線的 `TimeZone`
 
 ## 測試
 
-現有 88 條（`./venv/bin/pytest -q`）。動到解析或抓取就要跑，而且至少要保住這幾條：
+現有 99 條（`./venv/bin/pytest -q`）。動到解析或抓取就要跑，而且至少要保住這幾條：
 
 1. 欄位對應（用 fixture，斷言燃氣/太陽能/風力等對到正確的值）
 2. **兩支曲線總和吻合**的交叉測試 ← 最有價值的一條
@@ -361,6 +371,9 @@ naive datetime 進到 `timestamptz` 欄位，資料庫會拿連線的 `TimeZone`
 | 逐檔隔離改回一鍋端 | 壞 perc 不可拖垮曲線那條 |
 | 未來時點容忍值改成無限大 | 跨午夜錯標那條 |
 | rehome 不往回找（只看目前錨點）| loadpara 慢一格那條 |
+| rehome 的 max_back 改回 2 | 落後五格（8/13）那條 |
+| 新鮮側容忍改 0 | loadpara 更新鮮（8/14）那條 |
+| 失敗時照推 items_scraped=0 | 未知≠零那條 |
 
 ★ 做負向對照時如果「改壞了測試卻還是綠的」，先確認不是 **Python bytecode 快取**
 在騙你：改回去的檔案若**大小相同且在同一秒內寫入**，`.pyc` 的 (mtime, size)
