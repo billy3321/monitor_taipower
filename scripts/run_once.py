@@ -118,14 +118,20 @@ def _run(cfg: dict, now: datetime, started: float) -> tuple[str, int, int]:
             stamp, unit_totals = P.parse_unitdata(result.bodies['unitdata.json'])
             problems = P.verify_fuel_columns(points, stamp, unit_totals)
             if problems:
-                # ★★ 這是最該擋下來的一種失敗：欄位意義變了，寫進去的每一筆
-                #    都是錯的標籤，而且畫面正常。寧可整批不寫。
+                # ★★ 欄位意義變了，能源別寫進去的每一筆都會是錯的標籤，
+                #    而且畫面正常——必須丟掉。
+                # ★ 但**只丟能源別那一側**：區域別是另一支檔、另一組欄位，
+                #   跟這次的問題無關。整批丟掉就是 2026-08-28 那個錯誤的
+                #   形狀（台電一邊出問題，我們把整天的資料都不要了）。
+                dropped = sum(1 for p in points if p.kind == 'fuel')
                 log.error('欄位對應驗證失敗（來源可能改版，欄位對應要人工重新'
-                          '確認後改 FUEL_COLUMNS 與 PARSER_VERSION）：%s',
-                          '；'.join(problems))
+                          '確認後改 FUEL_COLUMNS 與 PARSER_VERSION）：%s'
+                          '——丟棄能源別 %d 點，區域別照常寫入',
+                          '；'.join(problems), dropped)
                 errors += 1
                 note_parts.append(f'欄位驗證失敗：{problems[0]}')
-                points = []
+                note_parts.append(f'丟棄能源別 {dropped} 點')
+                points = [p for p in points if p.kind != 'fuel']
             else:
                 verified = True
                 state.mark_verified(now)
@@ -178,10 +184,23 @@ def _run(cfg: dict, now: datetime, started: float) -> tuple[str, int, int]:
     #    結果是**台電自己算不齊，我們把整天的資料丟掉**——8/28 08:00 之後
     #    16 小時因此永久遺失（來源當日歸零、沒有歷史檔）。
     #
-    # ★ 所以現在：照樣寫入，把分岔記進 note。**不是把門檻調大讓它消失**——
-    #   分岔是台電那邊的狀態，要留在看得見的地方。
-    # ★ 兜底仍在：欄位由 3.2 按名字保證，數值由下面的 capacity 檢查
-    #   （對 loadpara 這個獨立第三檔）把關。不再加第三個門檻。
+    # ★ 所以現在：照樣寫入，把分岔**與「是哪一側在漂」**一起記進 note。
+    #   拿 loadpara 的即時用電當獨立裁判（實測 08-19~28 兩側都在 2 MW 內、
+    #   08-29 只有能源別跑到 46 MW），所以講得出是哪一邊，不是只說「對不上」。
+    #
+    # ★★ **刻意沒有上限門檻**（「分岔超過 N 就不寫」）。理由：能源別已經由
+    #    3.2 對逐機組 API 逐類驗過、區域別由 loadpara 驗過，兩側各自都是
+    #    台電自己說的數字。它們彼此不平衡是**台電的狀態**，不管差多少都是。
+    #    設一個上限只會在某天重演 8/28——把好好的資料丟掉。
+    #    真的大到不合理時，note 會寫著、人去查台電，而不是機器自己決定不要。
+    #
+    # ★★ 也**刻意不「湊平」**：短少的 0~336 MW 無法歸屬到任何一種發電方式
+    #    （12 類逐類都跟逐機組吻合），補一個「未分類」欄位就是**發明資料**。
+    #    正確的用法是：**總量看區域別／即時用電，組成看能源別**（見 CLAUDE.md）。
+    #
+    # ★ 而寫進去的東西**會自己修正**：upsert 是 ON CONFLICT DO UPDATE，
+    #   而且每次跑都重寫整天。台電哪天更正了，我們下一次跑就跟著更正。
+    #   「先寫進去、之後會修正」之所以安全，靠的就是這一條。
     kinds = {p.kind for p in points}
     if {'fuel', 'area'} <= kinds:
         checked = P.cross_check(points)
@@ -196,15 +215,29 @@ def _run(cfg: dict, now: datetime, started: float) -> tuple[str, int, int]:
             worst = P.worst_divergence(points)
             note_parts.append(f'曲線分岔 最新{diff:+.0f}/當日最大{worst:+.0f} MW')
             if abs(diff) >= P.CROSS_CHECK_TOLERANCE_MW:
+                verdict = P.name_the_drifting_side(P.diagnose_sides(points))
+                note_parts.append(verdict)
                 log.warning('兩支曲線分岔：%s 能源別 %.0f vs 區域別 %.0f（差 %+.0f）'
-                            '——台電自己兩份數字對不齊；欄位對應已另行驗證，照常寫入',
-                            t, ftot, atot, diff)
+                            '——%s。欄位對應已另行驗證，照常寫入（台電更正後'
+                            '下次跑會自動蓋回正確值）', t, ftot, atot, diff, verdict)
             else:
                 log.info('交叉檢查通過：%s 兩邊總和差 %+.0f MW', t, diff)
 
     # loadpara 的即時用電 vs 能源別合計（驗時點掛對了沒有）。
     # loadpara 偶爾比曲線慢一格，rehome 會往回找吻合的時點改掛——
     # 慢一格不算錯；連往回找都找不到才是真的不同步。
+    # ★★ 能源別被丟掉時，capacity 也要一起丟。rehome 是拿能源別當錨的，
+    #    沒有錨就驗不了時點——而這個模組的原則是「驗不了時點的 capacity
+    #    寧可不寫，不要掛在猜的時間上」（parse_loadpara 的既有立場）。
+    #    照原路走還會印出「不同步」這種誤導訊息：那不是不同步，是沒得比。
+    if any(p.kind == 'capacity' for p in points) and not any(
+            p.kind == 'fuel' for p in points):
+        n_cap = sum(1 for p in points if p.kind == 'capacity')
+        log.warning('能源別已被丟棄，capacity 沒有錨可以驗時點——一併不寫（%d 點）',
+                    n_cap)
+        note_parts.append(f'連帶不寫 capacity {n_cap} 點')
+        points = [p for p in points if p.kind != 'capacity']
+
     if any(p.kind == 'capacity' for p in points):
         orig_anchor = next(p.observed_at for p in points if p.kind == 'capacity')
         rehomed = P.rehome_capacity(points)

@@ -401,6 +401,59 @@ def rehome_capacity(points: list[Point], max_back: int = 6
     return None
 
 
+def diagnose_sides(points: list[Point]
+                   ) -> tuple[datetime, float | None, float | None] | None:
+    """兩支曲線各自離 loadpara 的即時用電多遠。回 (時點, 能源別偏離, 區域別偏離)。
+
+    ★★ 為什麼需要：兩支曲線總和對不上時，光看差值**不知道是哪一邊壞了**。
+       loadpara 的即時用電是**獨立的第三個檔**，可以當裁判。
+       實測正式庫 2026-08-19~28 共 197 個錨點，兩側都在 **2 MW 以內**；
+       08-29 區域別仍是 2 MW、能源別跑到 46 MW——**乾淨地指出是能源別那側**。
+
+    ★ 時點取「兩支曲線都有值的最新共同時點」，不是 loadpara 自己宣稱的時間。
+      loadpara 有時比曲線快或慢（見 rehome_capacity），但那個時間誤差
+      **對兩側是同一個**，所以拿來比「誰離得比較遠」仍然成立。
+      ★ 這一點很重要：診斷必須在**壞掉的時候**算得出來。如果改成依賴
+        rehome 成功（而 rehome 是拿能源別去錨的），能源別正是壞掉那側時
+        rehome 會失敗，於是最需要診斷的那一刻反而沒有診斷。"""
+    curr = next((p for p in points
+                 if p.kind == 'capacity' and p.label == '即時用電'
+                 and p.mw is not None), None)
+    if curr is None:
+        return None
+    common = ({p.observed_at for p in points if p.kind == 'fuel'}
+              & {p.observed_at for p in points if p.kind == 'area'})
+    if not common:
+        return None
+    at = max(common)
+    ftot = totals_at(points, 'fuel', at)
+    atot = totals_at(points, 'area', at)
+    return (at,
+            None if ftot is None else abs(ftot - curr.mw),
+            None if atot is None else abs(atot - curr.mw))
+
+
+def name_the_drifting_side(diag: tuple[datetime, float | None, float | None] | None,
+                           tolerance: float = CAPACITY_CHECK_TOLERANCE_MW) -> str:
+    """把 diagnose_sides 的數字講成一句人話，寫進 note 用。
+
+    ★ 只在**兩側偏離差距明顯**時才指名，否則說「判不出來」。
+      指錯邊比不指還糟：會叫人去修沒有壞的那一邊。
+    """
+    if diag is None:
+        return '無即時用電可比對'
+    at, fdev, adev = diag
+    if fdev is None or adev is None:
+        return '缺一側資料'
+    if fdev < tolerance and adev < tolerance:
+        return f'兩側都貼齊即時用電(能源別{fdev:.0f}/區域別{adev:.0f} MW)'
+    if fdev >= tolerance > adev:
+        return f'能源別偏離即時用電 {fdev:.0f} MW(區域別僅 {adev:.0f})'
+    if adev >= tolerance > fdev:
+        return f'區域別偏離即時用電 {adev:.0f} MW(能源別僅 {fdev:.0f})'
+    return f'兩側都偏離即時用電(能源別{fdev:.0f}/區域別{adev:.0f} MW)'
+
+
 def cross_check_capacity(points: list[Point]) -> tuple[float, float] | None:
     """★ 第三條交叉檢查：loadpara 的即時用電必須等於同時點的能源別合計。
 

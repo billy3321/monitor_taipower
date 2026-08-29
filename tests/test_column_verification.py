@@ -192,3 +192,75 @@ def test_corrupt_state_file_is_treated_as_unknown(tmp_path, monkeypatch):
     p.write_text('這不是時間', encoding='utf-8')
     monkeypatch.setattr(state, 'LAST_VERIFIED', p)
     assert state.unverified_for(datetime.now(timezone.utc)) is None
+
+
+# ── 兩支曲線對不上時：判得出是哪一側 ────────────────────────────
+
+def _with_capacity(points, at, mw):
+    """把一個「即時用電」點掛在指定時點上（模擬 loadpara）。"""
+    return points + [P.Point(at, 'capacity', '即時用電', mw)]
+
+
+def test_loadpara_names_the_drifting_side(points):
+    """★★ 兩支曲線總和對不上時，光看差值**不知道是哪一邊壞了**。
+    loadpara 的即時用電是獨立的第三個檔，可以當裁判。
+
+    實測正式庫 2026-08-19~28 共 197 個錨點兩側都在 2 MW 內；08-29 區域別
+    仍是 2 MW、能源別跑到 46 MW——乾淨地指出是能源別那側。
+    """
+    at = max({p.observed_at for p in points if p.kind == 'fuel'}
+             & {p.observed_at for p in points if p.kind == 'area'})
+    area_total = P.totals_at(points, 'area', at)
+
+    # 即時用電貼著區域別（實測就是這樣）→ 應該指名能源別
+    diag = P.diagnose_sides(_with_capacity(points, at, area_total))
+    verdict = P.name_the_drifting_side(diag)
+    _, fdev, adev = diag
+    assert adev < 1.0, f'區域別應該貼齊即時用電，得到 {adev}'
+    if fdev >= P.CAPACITY_CHECK_TOLERANCE_MW:
+        assert '能源別偏離' in verdict, verdict
+
+
+def test_diagnosis_points_at_whichever_side_is_off(points):
+    """反面：換成**區域別**壞掉，就該指名區域別。
+
+    ★ 判準不可以寫死成「永遠怪能源別」——今天是它，明天可能是另一邊。
+      第一版這條寫成「指名區域別 or 兩側都貼齊」，於是把 name_the_drifting_side
+      的區域別分支改成回傳「能源別」之後，測試照樣全綠（最新時點本來就常常
+      兩側都吻合，走的是「都貼齊」那條）。**選言的斷言會放過突變**——
+      改成造一個區域別確實偏離的情境，只接受一個答案。"""
+    at = max({p.observed_at for p in points if p.kind == 'fuel'}
+             & {p.observed_at for p in points if p.kind == 'area'})
+    fuel_total = P.totals_at(points, 'fuel', at)
+    broken_area = [P.Point(p.observed_at, p.kind, p.label,
+                           None if p.mw is None else p.mw * 0.9)
+                   if p.kind == 'area' else p for p in points]
+    diag = P.diagnose_sides(_with_capacity(broken_area, at, fuel_total))
+    _, fdev, adev = diag
+    assert fdev < P.CAPACITY_CHECK_TOLERANCE_MW <= adev, (fdev, adev)
+    assert '區域別偏離' in P.name_the_drifting_side(diag)
+
+
+def test_diagnosis_works_even_when_fuel_is_the_broken_side(points):
+    """★★ 最重要的一條：診斷必須在**壞掉的時候**算得出來。
+
+    rehome_capacity 是拿能源別去錨的，能源別正是壞掉那側時 rehome 會失敗。
+    diagnose_sides 刻意不依賴 rehome——它取「兩支曲線都有值的最新共同時點」，
+    時間誤差對兩側是同一個，比「誰離得遠」仍然成立。
+    """
+    at = max({p.observed_at for p in points if p.kind == 'fuel'}
+             & {p.observed_at for p in points if p.kind == 'area'})
+    area_total = P.totals_at(points, 'area', at)
+    broken = [P.Point(p.observed_at, p.kind, p.label,
+                      None if p.mw is None else p.mw * 0.9)
+              if p.kind == 'fuel' else p for p in points]
+    pts = _with_capacity(broken, at, area_total)
+    assert P.rehome_capacity(pts) is None, '前提：能源別壞成這樣 rehome 應該失敗'
+    verdict = P.name_the_drifting_side(P.diagnose_sides(pts))
+    assert '能源別偏離' in verdict, f'rehome 失敗時仍要判得出來，得到 {verdict}'
+
+
+def test_no_capacity_means_cannot_judge_not_all_clear(points):
+    """★ 沒有即時用電時要說「無法比對」，不可以回一句像通過的話。"""
+    assert P.diagnose_sides(points) is None
+    assert P.name_the_drifting_side(None) == '無即時用電可比對'
