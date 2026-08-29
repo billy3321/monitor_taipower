@@ -35,6 +35,23 @@ FUEL_COLUMNS = [
 # ★ 不是「東北中南」。最後一欄對應北部——用官網當日數字對帳確認過。
 AREA_COLUMNS = ['東部', '南部', '中部', '北部']
 
+# ★★ 開放資料 d006001（unitdata.json）的「機組類型」→ 我們的欄位名稱。
+#    兩邊指的是同一件事，只是台電自己在兩個地方用了不同寫法。
+#    列在這裡的都是**已知等價**；沒列到的名稱一律當成「新類型」處理
+#    （見 verify_fuel_columns），不會被猜著對應過去。
+FUEL_TYPE_ALIASES = {'燃料油': '重油'}
+
+# 逐機組資料要對得上曲線，兩邊同一類的合計差不得超過這個值（MW）。
+#
+# ★★ 1.0 不是「調到剛好會過」的數字，是**四捨五入的上界**：
+#    曲線 CSV 的單位是萬瓩且只到小數一位（0.1 萬瓩 ＝ 1 MW），逐機組是
+#    0.1 MW。同一個量在兩邊最多就差半格 ＝ 0.5 MW。2026-08-29 20:50 實測
+#    12 類最大差 0.5（燃氣 15157.0 vs 15157.5），完全符合這個推導。
+# ★ 所以這條檢查是**緊的**：真正的欄位位移會讓某一類差好幾千 MW，
+#   在 1 MW 的門檻下無所遁形。放寬它就等於放棄這個檢查的全部價值——
+#   哪天它開始跳，要查的是台電改了什麼，不是把數字調大。
+UNIT_MATCH_TOLERANCE_MW = 1.0
+
 # loadpara.json：kind='capacity'。★ 只取**單位是萬瓩**的欄位。
 #
 # 百分比欄（curr_util_rate、fore_peak_resv_rate）與文字欄（indicator、
@@ -193,6 +210,108 @@ def _parse_full_timestamp(raw: str) -> datetime:
     raise ParseError(f'genloadareaperc 的時戳認不得：{raw!r}')
 
 
+def parse_unitdata(body: bytes) -> tuple[datetime, dict[str, float]]:
+    """unitdata.json（開放資料 d006001）→ (時戳, {機組類型: 淨發電量 MW})。
+
+    ★★ 這支是這批來源裡**唯一自己帶欄位名稱**的。另外兩支曲線 CSV 沒有標頭，
+       12 欄／4 欄的意義只寫在圖表的 JavaScript 裡——原本我們把欄序寫死，
+       等於假設台電永遠不改。而 load_fueltype_.html 裡第一欄的「核能」
+       只是被 /* */ 註解掉，核能一旦重啟就會位移一格，我們會把每一種
+       發電方式都標錯，**而圖表看起來完全正常**。
+
+    ★ 單位：這支的「淨發電量(MW)」本來就是 MW，**不必**乘 WAN_KW_TO_MW。
+      曲線 CSV 是萬瓩。兩邊單位不同是最容易寫錯的一格。
+
+    ★ 機組類型欄實測夾著 HTML 殘渣（台電自己的 bug）：
+      `儲能負載(Energy Storage System Load)</b>`。所以要先去標籤、
+      再砍掉括號後的英文，最後查 FUEL_TYPE_ALIASES。
+    """
+    try:
+        doc = json.loads(body.decode('utf-8-sig'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ParseError(f'unitdata.json 不是合法 JSON：{exc}') from None
+    if not isinstance(doc, dict) or 'aaData' not in doc or 'DateTime' not in doc:
+        raise ParseError('unitdata.json 結構不符預期（缺 DateTime 或 aaData）：'
+                         f'{str(doc)[:120]}')
+
+    stamp = _parse_full_timestamp(doc['DateTime'].replace('T', ' '))
+    totals: dict[str, float] = {}
+    for row in doc['aaData']:
+        if not isinstance(row, dict) or '機組類型' not in row:
+            raise ParseError(f'unitdata.json 的列缺少「機組類型」：{str(row)[:120]}')
+        totals[normalise_fuel_type(row['機組類型'])] = (
+            totals.get(normalise_fuel_type(row['機組類型']), 0.0)
+            + (parse_unit_mw(row.get('淨發電量(MW)')) or 0.0))
+    if not totals:
+        raise ParseError('unitdata.json 一台機組都沒有（不等於全台停電）')
+    return stamp, totals
+
+
+def normalise_fuel_type(raw: str) -> str:
+    """機組類型字串 → 我們的欄位名稱。砍掉括號後的英文，再查別名表。
+
+    ★ 實測有一個值夾著 HTML 殘渣（台電自己的 bug）：
+      `儲能負載(Energy Storage System Load)</b>`。**括號切割本來就吃掉它了**，
+      所以這裡不另外去標籤——加一條沒有測試蓋得到的正則只是臆測。
+
+    ★ 萬一哪天冒出括號**前**就有標籤的寫法，失敗方向是安全的：它會變成一個
+      「我們沒有欄位的類型」，verify_fuel_columns 會大聲擋下來，不會被默默
+      正規化成某個既有類別。寧可假警報，不要靜默錯標。"""
+    s = (raw or '').split('(')[0].strip()
+    return FUEL_TYPE_ALIASES.get(s, s)
+
+
+def parse_unit_mw(raw: str | None) -> float | None:
+    """逐機組的「淨發電量(MW)」→ float。★ 已經是 MW，不再換算。
+
+    ★ 認不得的字面回 None 而不是丟例外——**與曲線 CSV 的 parse_number 不同**。
+      理由：這支是拿來對帳的旁證，單一機組欄位髒掉不該讓整次抓取失敗；
+      而曲線 CSV 是資料本體，那裡認不得就必須停下來。
+    """
+    s = (raw or '').strip().replace(',', '')
+    if s in NULL_TOKENS:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def verify_fuel_columns(points: list[Point], stamp: datetime,
+                        unit_totals: dict[str, float]) -> list[str]:
+    """拿逐機組資料按**名字**驗能源別 12 欄的對應。回傳問題清單（空＝通過）。
+
+    ★★ 這是「不賭欄序」的關鍵一步。原本欄序是寫死的假設、沒有任何東西在
+       檢查；現在每次跑都拿台電自己帶名稱的資料一類一類對帳，對不上就
+       **不寫**並指名是哪一類。核能重啟那天，第一次跑就會擋下來。
+
+    ★ 已知限制，刻意不掩蓋：晚上「太陽能」與「儲能負載」都是 0，那個瞬間
+      光看數值分不出這兩欄，對調了也驗得過。但一天跑 25 次、其中十幾次在
+      白天，太陽能一有出力就分得出來——**這個模糊窗每天自己會關**。
+      所以這支的語意是「這一輪沒有發現不一致」，不是「永遠保證正確」。
+    """
+    curve = {p.label: p.mw for p in points
+             if p.kind == 'fuel' and p.observed_at == stamp}
+    if not curve:
+        return []                       # 沒有共同時點就不下判斷（未知≠不一致）
+
+    problems: list[str] = []
+    # ① 出現我們沒有欄位的類型 → 幾乎確定是欄位改版，最該擋下來的情況
+    unknown = sorted(set(unit_totals) - set(FUEL_COLUMNS))
+    if unknown:
+        problems.append(f'逐機組出現我們沒有欄位的類型 {unknown}'
+                        f'（欄位改版？我們的 12 欄是 {FUEL_COLUMNS}）')
+    # ② 逐類比對
+    for label in FUEL_COLUMNS:
+        got, want = curve.get(label), unit_totals.get(label)
+        if got is None or want is None:
+            problems.append(f'{label}：曲線={got}、逐機組={want}（其中一邊沒有）')
+        elif abs(got - want) >= UNIT_MATCH_TOLERANCE_MW:
+            problems.append(f'{label}：曲線={got:.1f}、逐機組={want:.1f}'
+                            f'（差 {got - want:+.1f} MW）')
+    return problems
+
+
 def parse_loadpara(body: bytes, observed_at: datetime) -> list[Point]:
     """loadpara.json → kind='capacity' 的 Point。
 
@@ -301,13 +420,34 @@ def cross_check_capacity(points: list[Point]) -> tuple[float, float] | None:
     return curr.mw, fuel_total
 
 
+def worst_divergence(points: list[Point]) -> float:
+    """當天所有共同時點裡，能源別合計 − 區域別合計的**絕對值最大**那一個（帶正負）。
+
+    ★ 為什麼要記這個而不是只記最新時點：交叉檢查從 2026-08-29 起不再擋資料，
+      分岔就必須留在看得見的地方，否則等於「調寬門檻讓異常消失」。
+      最新那一點可能剛好吻合（實測 123 個時點裡有 31 個是吻合的），
+      只看它會讓一整天 75% 的時點分岔完全不出現在紀錄上。
+    """
+    fuel: dict[datetime, float] = {}
+    area: dict[datetime, float] = {}
+    for p in points:
+        if p.mw is None:
+            continue
+        if p.kind == 'fuel':
+            fuel[p.observed_at] = fuel.get(p.observed_at, 0.0) + p.mw
+        elif p.kind == 'area':
+            area[p.observed_at] = area.get(p.observed_at, 0.0) + p.mw
+    diffs = [fuel[t] - area[t] for t in fuel.keys() & area.keys()]
+    return max(diffs, key=abs) if diffs else 0.0
+
+
 def taipei_today() -> date:
     """★ 「今日」要用台北時區的今天。用 UTC 日期會在早上 8 點前錯一天。"""
     return datetime.now(TAIPEI).date()
 
 
 def parse_files(bodies: dict[str, bytes]) -> tuple[list[Point], list[str]]:
-    """四支檔各自解析，**單檔失敗不拖垮其他檔**——與抓取失敗同一條原則：
+    """曲線各檔各自解析，**單檔失敗不拖垮其他檔**——與抓取失敗同一條原則：
     解析失敗的檔 ≈ 沒抓到的檔，跳過它、記一筆錯誤、其他檔照常處理。
 
     ★ 這是正式執行路徑用的。一個大 try 包住全部的寫法踩過的坑：
@@ -354,7 +494,8 @@ def parse_files(bodies: dict[str, bytes]) -> tuple[list[Point], list[str]]:
 def parse_all(fuel_body: bytes | None, area_body: bytes | None,
               perc_body: bytes | None,
               loadpara_body: bytes | None = None) -> list[Point]:
-    """嚴格版：四支檔 → 全部 Point，任何一支解析失敗就丟例外。
+    """嚴格版：四支曲線檔 → 全部 Point，任何一支解析失敗就丟例外。
+    ★ 不含 unitdata.json——那支是驗欄位用的旁證，不產生 Point。
 
     給測試與驗收腳本用。正式執行路徑用 parse_files()——單檔失敗要隔離。
     """

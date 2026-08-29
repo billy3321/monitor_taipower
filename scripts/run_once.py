@@ -21,9 +21,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))               # launchd 的 cwd 是專案根，但保險起見
 
 from taipower_curve import archive                   # noqa: E402
-from taipower_curve import config as cfgmod          # noqa: E402
-from taipower_curve import db, fetch, telemetry      # noqa: E402
-from taipower_curve import parser as P               # noqa: E402
+from taipower_curve import state                     # noqa: E402
+from taipower_curve import config as cfgmod           # noqa: E402
+from taipower_curve import db, fetch, telemetry       # noqa: E402
+from taipower_curve import parser as P                # noqa: E402
 
 log = logging.getLogger('run_once')
 
@@ -102,6 +103,54 @@ def _run(cfg: dict, now: datetime, started: float) -> tuple[str, int, int]:
         errors += 1
         note_parts.append(why.split('：')[0])
 
+    # ── 3.2 欄位對應驗證（按名字，不是按順序）★★ ──────────────────
+    #   曲線 CSV 沒有標頭列，12 欄／4 欄的意義只寫在圖表的 JavaScript 裡。
+    #   在此之前我們把欄序寫死在 parser.py，等於**假設台電不會改**——而
+    #   load_fueltype_.html 裡第一欄的「核能」只是被 /* */ 註解掉，
+    #   核能一旦重啟、註解拿掉，12 欄全部位移一格，我們會把每一種發電方式
+    #   都標錯，**而圖表看起來完全正常，可能好幾個月沒人發現**。
+    #
+    #   開放資料 d006001（unitdata.json）是這批來源裡唯一自己帶欄位名稱的，
+    #   所以每次跑都拿它按「機組類型」逐類對帳。對不上就不寫，並指名是哪一類。
+    verified = False
+    if 'unitdata.json' in result.bodies:
+        try:
+            stamp, unit_totals = P.parse_unitdata(result.bodies['unitdata.json'])
+            problems = P.verify_fuel_columns(points, stamp, unit_totals)
+            if problems:
+                # ★★ 這是最該擋下來的一種失敗：欄位意義變了，寫進去的每一筆
+                #    都是錯的標籤，而且畫面正常。寧可整批不寫。
+                log.error('欄位對應驗證失敗（來源可能改版，欄位對應要人工重新'
+                          '確認後改 FUEL_COLUMNS 與 PARSER_VERSION）：%s',
+                          '；'.join(problems))
+                errors += 1
+                note_parts.append(f'欄位驗證失敗：{problems[0]}')
+                points = []
+            else:
+                verified = True
+                state.mark_verified(now)
+                log.info('欄位對應驗證通過：%s 逐機組 12 類逐類吻合', stamp)
+        except P.ParseError as exc:
+            # 驗證資料本身壞掉 ≈ 沒抓到，不該讓曲線一起陪葬（與其他檔同一原則）
+            log.warning('unitdata.json 解析失敗，本次欄位對應未驗證：%s', exc)
+            note_parts.append('欄位未驗證(解析失敗)')
+    else:
+        note_parts.append('欄位未驗證(抓取失敗)')
+    if not verified and points:
+        # ★★ 退回「按寫死的欄序解析」是**降級模式**，不是正常狀態。單次退回
+        #    只記 note（驗證資料壞掉不該讓曲線陪葬），但**不能無聲無息變成
+        #    常態**：台電哪天把那支開放資料的網址換掉，我們會一路退回猜測
+        #    模式，而 note 沒有人在看。超過 24 小時沒驗成功就升級成失敗，
+        #    讓存活告警燒起來。
+        log.warning('本次未經欄位驗證，沿用寫死的欄序——這是降級模式')
+        age = state.unverified_for(now)
+        if age is None or age > state.MAX_UNVERIFIED:
+            how_long = '從來沒驗證成功過' if age is None else f'已經 {age} 沒驗證成功'
+            log.error('欄位對應%s（上限 %s）——降級模式不可以變成常態，'
+                      '本次標記為失敗讓告警燒起來', how_long, state.MAX_UNVERIFIED)
+            errors += 1
+            note_parts.append(f'欄位驗證過期({how_long})')
+
     # ── 3.5 跨午夜防線：未來的點一律整批拒寫 ─────────────────────
     #   慢速抓取跨過 00:00 時檔案可能已換日重置，舊日資料會被 perc 的
     #   新日期標成「未來」。這批寫進去會變成掛在圖上的整天假資料。
@@ -111,28 +160,47 @@ def _run(cfg: dict, now: datetime, started: float) -> tuple[str, int, int]:
                   '這次整批不寫入', len(future),
                   max(p.observed_at for p in future))
         errors += 1
+        # ★ note 要寫得出「是哪一道擋的」。2026-08-29 查這件事時，四道閘門
+        #   失敗全都只寫「無資料」三個字，花了十幾次查詢才反推出是交叉檢查。
+        note_parts.append(f'未來時點 {len(future)} 個')
         points = []
 
-    # ── 4. 交叉檢查 ──────────────────────────────────────────────
+    # ── 4. 交叉檢查：兩支曲線總和 ────────────────────────────────
+    #
+    # ★★ 2026-08-29 這條**從「擋下來」降級成「記下來」**，理由是它原本
+    #    兼任的工作已經被 3.2 的欄位驗證取代，而它做那份工作做得不好：
+    #
+    #    它比的是兩個**總和**，所以兩個能源別欄位對調它根本驗不出來
+    #    （總和不變）；反過來，台電自己兩份數字對不齊時它會整批擋下。
+    #    2026-08-28 08:00 起就是後者：能源別合計比區域別低 0~336 MW
+    #    （拿第三個檔 loadpara 的即時用電當裁判，區域別差 ±2、能源別差
+    #    −11~−46，是台電的能源別那側在漂），12 欄逐類對帳全部吻合。
+    #    結果是**台電自己算不齊，我們把整天的資料丟掉**——8/28 08:00 之後
+    #    16 小時因此永久遺失（來源當日歸零、沒有歷史檔）。
+    #
+    # ★ 所以現在：照樣寫入，把分岔記進 note。**不是把門檻調大讓它消失**——
+    #   分岔是台電那邊的狀態，要留在看得見的地方。
+    # ★ 兜底仍在：欄位由 3.2 按名字保證，數值由下面的 capacity 檢查
+    #   （對 loadpara 這個獨立第三檔）把關。不再加第三個門檻。
     kinds = {p.kind for p in points}
     if {'fuel', 'area'} <= kinds:
         checked = P.cross_check(points)
         if checked is None:
             log.error('兩支曲線沒有共同時間點——時間欄格式可能變了，這次不寫入')
             errors += 1
+            note_parts.append('兩支曲線無共同時點')
             points = []
         else:
             t, ftot, atot = checked
-            diff = abs(ftot - atot)
-            if diff >= P.CROSS_CHECK_TOLERANCE_MW:
-                # ★ 總和分岔＝欄序錯置的訊號。寫進去的話整張圖標籤錯位，
-                #   而且畫面看起來完全正常——這是本專案最怕的靜默失敗。
-                log.error('交叉檢查失敗：%s 能源別 %.0f MW vs 區域別 %.0f MW（差 %.0f）'
-                          '——疑似欄序錯置，這次不寫入', t, ftot, atot, diff)
-                errors += 1
-                points = []
+            diff = ftot - atot
+            worst = P.worst_divergence(points)
+            note_parts.append(f'曲線分岔 最新{diff:+.0f}/當日最大{worst:+.0f} MW')
+            if abs(diff) >= P.CROSS_CHECK_TOLERANCE_MW:
+                log.warning('兩支曲線分岔：%s 能源別 %.0f vs 區域別 %.0f（差 %+.0f）'
+                            '——台電自己兩份數字對不齊；欄位對應已另行驗證，照常寫入',
+                            t, ftot, atot, diff)
             else:
-                log.info('交叉檢查通過：%s 兩邊總和差 %.0f MW', t, diff)
+                log.info('交叉檢查通過：%s 兩邊總和差 %+.0f MW', t, diff)
 
     # loadpara 的即時用電 vs 能源別合計（驗時點掛對了沒有）。
     # loadpara 偶爾比曲線慢一格，rehome 會往回找吻合的時點改掛——
@@ -144,6 +212,7 @@ def _run(cfg: dict, now: datetime, started: float) -> tuple[str, int, int]:
             log.error('即時用電對不上最近幾個時點的能源別合計——loadpara 與曲線'
                       '真的不同步（不只是慢一格），這次不寫 capacity')
             errors += 1
+            note_parts.append('即時用電與曲線不同步')
             points = [p for p in points if p.kind != 'capacity']
         else:
             points, anchored_at, diff = rehomed

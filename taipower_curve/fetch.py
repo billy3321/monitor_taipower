@@ -26,6 +26,30 @@ REFERERS = {
     'loadareas.csv': _PAGE.format(10263),
     'genloadareaperc.csv': _PAGE.format(10264),
     'loadpara.json': _PAGE.format(10264),
+    'unitdata.json': _PAGE.format(10264),
+}
+
+# ★★ 不同主機的檔要走這裡。曲線那四支在 www.taipower.com.tw 的圖表資料目錄下，
+#    unitdata.json 是**開放資料平台**（service.taipower.com.tw）的
+#    d006001「各機組發電量」——它是這批來源裡**唯一自己帶欄位名稱**的。
+#
+# ★★ 它存在的理由：另外那三支 CSV **沒有標頭列**，12 欄／4 欄各是什麼意思
+#    只寫在圖表的 JavaScript 裡。原本我們把欄序寫死在 parser.py，那是
+#    「假設台電不會改」——而 load_fueltype_.html 裡第一欄的「核能」
+#    只是被 /* */ 註解掉而已，核能一旦重啟、註解拿掉，12 欄全部位移一格，
+#    我們會把每一種發電方式都標錯，**而圖表看起來完全正常**。
+#    改成每次跑都拿這支按名字對帳，欄序就不再是假設而是**每次驗過的事實**。
+#
+# ★ 為什麼不乾脆全部改用這支：它是**單一時點的快照**，不是曲線。
+#   CSV 是「今天到目前為止的完整檔」，一次抓成功就把整天補回來——
+#   2026-08-29 就是靠這個特性，失敗十幾次仍然沒掉今天的資料。
+#   改成純輪詢就失去回補能力，漏一次就永遠少那幾個點。
+# ★ 同平台的 d006010（逐機組歷史曲線）**刻意不抓**：189 MB、落後約四個月、
+#   而且口徑不同（只有台電自有機組，沒有民營電廠，類別也只有 10 種），
+#   拿來對帳會得到系統性偏低的假分岔。
+_OPENDATA = 'https://service.taipower.com.tw/data/opendata/apply/file'
+URLS = {
+    'unitdata.json': f'{_OPENDATA}/d006001/001.json',
 }
 # 期望的內容形態。★ content-type 與內容都要驗：回 200 但吐挑戰頁（HTML）
 #   必須當成失敗，不是「今天沒資料」。
@@ -34,13 +58,17 @@ EXPECTED = {
     'loadareas.csv': 'csv',
     'genloadareaperc.csv': 'csv',
     'loadpara.json': 'json',
+    'unitdata.json': 'json',
 }
 FILES = list(REFERERS)
 
 
 def source_url(name: str) -> str:
-    """抓下來的資料要帶原始網址（平台紀律），歸檔與 fetch_run 都用這個。"""
-    return f'{BASE}/{name}'
+    """抓下來的資料要帶原始網址（平台紀律），歸檔與 fetch_run 都用這個。
+
+    ★ 大部分檔在 BASE 底下，但開放資料平台那支在另一個主機，走 URLS 覆寫。
+    """
+    return URLS.get(name) or f'{BASE}/{name}'
 
 
 class FetchError(Exception):
@@ -92,7 +120,7 @@ def make_session() -> requests.Session:
 
 def fetch_one(session: requests.Session, name: str, user_agent: str,
               timeout: float = 25.0) -> bytes:
-    url = f'{BASE}/{name}'
+    url = source_url(name)
     try:
         r = session.get(url, headers=build_headers(user_agent, REFERERS[name]),
                         timeout=timeout)
@@ -146,7 +174,12 @@ def _validate(name: str, r: requests.Response) -> None:
 
 
 def fetch_all(user_agent: str, delay: float = 1.0) -> FetchResult:
-    """抓四支檔。★ 每次執行只打 4 個請求、之間 sleep，不做重試風暴。"""
+    """抓五支檔。★ 每次執行只打 5 個請求、之間 sleep，不做重試風暴。
+
+    第五支是驗欄位用的 unitdata.json（開放資料，另一個主機）。
+    ★ 它抓不到不該讓曲線一起失敗——errors 逐檔記錄，呼叫端自己決定，
+      run_once 對它的處理是「本次欄位未驗證」而不是「本次失敗」。
+    """
     session = make_session()
     bodies: dict[str, bytes] = {}
     errors: dict[str, str] = {}
