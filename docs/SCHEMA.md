@@ -127,7 +127,7 @@ ON CONFLICT (observed_at, kind, label) DO UPDATE
   例如 `/Users/.../data/raw/2026-08-06/142044`
 - `raw_sha256` = 該目錄下 `MANIFEST.txt` 的 sha256
 - `MANIFEST.txt` 每行是「檔名 → 來源網址 → bytes → 該檔 sha256」，
-  所以驗 MANIFEST 一份等於驗全部四支檔
+  所以驗 MANIFEST 一份等於驗全部五支檔
 
 ★ 這改變了 `raw_uri` 先前的語意（原本放 base URL）。來源網址現在記在
 MANIFEST 裡，每支檔各自對應——比一個共用的 base URL 精確。

@@ -61,6 +61,11 @@ Cloud SQL 的 **`strait_info_monitor_prod`**（2026-08-06 起；先前是 `dashb
 | `loadareas.csv` | 今日用電曲線－依區域別（4 欄）| **當日累積**，一抓拿回整天 |
 | `genloadareaperc.csv` | 各區發電／用電占比 | **只有當下**，一次一點 |
 | `loadpara.json` | 即時供電能力、即時用電、尖峰預估 | **只有當下**，一次一點 |
+| `unitdata.json`（開放資料 d006001）| 逐機組發電量，**帶「機組類型」名稱** | **只有當下**，不寫進資料庫 |
+
+★ 第五支不產生任何資料列，它的用途是**驗欄位**：前兩支 CSV 沒有標頭，
+12 欄／4 欄的意義只寫在圖表的 JavaScript 裡。每次跑都拿它按機組類型
+逐類跟曲線對帳，對不上就不寫那一側（見 CLAUDE.md「欄位對應」）。
 
 **★ 因為前兩支是「當日累積」，每小時抓一次就能拿到全部 144 個 10 分鐘點——
 不需要每 10 分鐘跑。** 這是這個設計最重要的一點。
@@ -91,8 +96,13 @@ cp config/config.yml.example config/config.yml   # 填密碼與 pushgateway
 ```
 
 `preflight.py` 與 `verify_fixtures.py` **不碰資料庫也不需要 config**，
-所以是排錯時第一個該跑的兩支。`verify_fixtures.py` 會印出兩支曲線的總和並比對——
-差 50 MW 以內才算欄位對應正確（實測差 1 MW）。
+所以是排錯時第一個該跑的兩支。`verify_fixtures.py` 會印出兩支曲線的總和並比對。
+
+★★ 但**不要再拿「兩支曲線總和吻合」當欄位對應是否正確的判準**。
+   2026-08-28 08:00 起台電自己兩份數字就開始對不齊（差到 336 MW），
+   而 12 欄逐類跟逐機組 API 對帳全部吻合——**總和分岔不代表我們解析錯**。
+   現在的判準是執行期的逐類對帳（見 CLAUDE.md「欄位對應」），
+   `verify_fixtures.py` 印的總和只是給人看的參考。
 
 ### 憑證
 
@@ -137,6 +147,13 @@ Pushgateway 的防火牆規則。換網路（VPN、熱點、不同網段）就�
 | 漏掉當天最後兩次（23:55、23:59）| 當天尾巴永久遺失（檔案 00:00 換日重置）|
 | 整天都沒成功 | 該日曲線永久遺失 |
 | 任何一次漏掉 | `area_gen` / `capacity` 少一個時間點，**永久補不回**（不累積）|
+| **某次成功之後全部失敗到隔天** | **從那次成功到午夜整段永久遺失** ← 2026-08-28 就是這個 |
+
+★★ 最後那一列是 2026-08-28 真的發生的事，值得記住它的形狀：那天 8 次成功
+（00:55~07:55）之後全部失敗，於是 **08:00~23:50 共 16 小時沒了**。
+而健康列顯示 **fresh**——因為當天稍早確實成功過，`last_success` 是新的。
+**「今天有成功過」不等於「今天的資料是完整的」。** 要確認完整性得看
+下面「確認它真的在做事」的時點數查詢，不是看健康列。
 
 實務門檻：
 
@@ -153,6 +170,9 @@ Pushgateway 的防火牆規則。換網路（VPN、熱點、不同網段）就�
 | `status='error'`、訊息提到 CloudFront/HTML | 出口 IP 被台電擋 | `./venv/bin/python scripts/preflight.py` |
 | `status='error'`、訊息說「資料庫端」 | IP 不在 Cloud SQL 白名單 | `curl -s https://api.ipify.org` 對照白名單 |
 | 執行正常但遙測 WARNING 推不上去 | IP 不在 Pushgateway 防火牆白名單 | `curl -m 20 <pushgateway>/metrics` 要回 200 |
+| `status='error'`、note 寫 `欄位驗證失敗：…` | **台電可能改了欄位** | 看 note 指名的類別；人工比對後改 `FUEL_COLUMNS` 與 `PARSER_VERSION` |
+| `status='error'`、note 寫 `欄位驗證過期(…)` | 逐機組 API 連不上超過 24 小時 | `curl` 那個開放資料網址；台電換網址就要改 `fetch.URLS` |
+| note 寫 `曲線分岔 …` 但 status 是 ok | **台電自己兩份數字對不齊** | 不是我們的問題，不用修；note 會一併寫是哪一側在漂 |
 
 ★ 判定「連不上」前**給足 20 秒並重測兩三次**，且分清逾時（路由／防火牆）
 與 connection refused（服務沒起來）——2026-08-05 就因為只用 8 秒逾時測了一次，
@@ -194,6 +214,21 @@ FROM monitor_fetch_run WHERE source_id='taipower_loadcurve'
 ORDER BY fetched_at;
 ```
 
+```sql
+-- 台電自己兩份數字差多少（2026-08-28 起會非零，那是台電的狀態不是我們的錯）
+-- ★ 這條也是「資料完整性」的實用檢查：時點數應該隨當天時間長到 144
+SELECT count(DISTINCT observed_at) AS 時點數,
+       max(abs(f - a))::int AS 當日最大分岔_MW
+FROM (SELECT observed_at,
+             sum(mw) FILTER (WHERE kind='fuel') f,
+             sum(mw) FILTER (WHERE kind='area') a
+      FROM monitor_power_load_curve
+      WHERE (observed_at AT TIME ZONE 'Asia/Taipei')::date
+            = (now() AT TIME ZONE 'Asia/Taipei')::date
+      GROUP BY 1) t
+WHERE f IS NOT NULL AND a IS NOT NULL;
+```
+
 日誌在 `/tmp/taipower-curve.log`。
 
 ## 這個專案**不做**什麼
@@ -203,3 +238,9 @@ ORDER BY fetched_at;
   （見 `docs/SCHEMA.md`），這裡只 upsert 自己那兩張
 - 不重試到天荒地老：抓不到就記一次失敗並推遙測，讓監控看得見
 - 不往「規避封鎖」的方向做：擋的是 IP／ASN，調標頭沒用也不該試
+- **不「湊平」台電的數字**：兩份數字對不齊時，短少的部分無法歸屬到任何一種
+  發電方式（12 類逐類都跟逐機組 API 吻合），補一個「未分類」欄位就是**發明資料**。
+  正確的用法是分工——**總量看區域別／即時用電，組成看能源別**。
+- 不抓 `d006009`／`d006010`（區域間潮流、逐機組歷史曲線）：季度歷史檔、
+  189 MB、落後約四個月，而且口徑不同（只有台電自有機組、10 類）。
+  這台機器有流量限制，而它也不合用。
