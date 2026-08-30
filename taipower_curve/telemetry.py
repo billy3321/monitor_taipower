@@ -45,24 +45,31 @@ def push(cfg: dict, *, run_ts: float, status: str, items: int,
     #   ok / no_coverage（確實沒有紀錄）/ 有寫入的部分失敗，筆數都是可信的。
     items_known = status in ('ok', 'no_coverage') or items > 0
 
+    # ★ help 字串一律照共用標準 S4.2 的 canon 逐字寫。Pushgateway 會把所有 group
+    #   的同名指標併成一個 metric family，help 不一致就每次推送都印
+    #   `inconsistent help strings`——取值不受影響，但那是契約漂移的訊號。
     registry = CollectorRegistry()
-    Gauge('scrapy_last_run_timestamp_seconds', '最後一次執行的時間',
+    Gauge('scrapy_last_run_timestamp_seconds',
+      '每次執行都推（不論成功失敗），用來區分「沒跑」與「跑了但沒成功」',
           registry=registry).set(run_ts)
-    Gauge('scrapy_log_errors', '這次執行的錯誤數',
+    Gauge('scrapy_log_errors', '本次錯誤數',
           registry=registry).set(errors)
-    Gauge('scrapy_run_duration_seconds', '這次執行耗時',
+    Gauge('scrapy_run_duration_seconds', '本次執行秒數',
           registry=registry).set(duration)
-    Gauge('scrapy_max_stale_seconds', '多久沒成功算太舊（告警門檻）',
+    Gauge('scrapy_max_stale_seconds',
+      '這個來源自己宣告多久沒成功算太舊（告警門檻用這個，不要另外寫死）',
           registry=registry).set(MAX_STALE_SECONDS)
-    Gauge('scrapy_items_unknown', '這次的筆數是否為未知（1=未知，勿當 0 讀）',
+    Gauge('scrapy_items_unknown', '1＝筆數未知（抓取失敗），0＝確實是那個數字',
           registry=registry).set(0 if items_known else 1)
     if items_known:
-        Gauge('scrapy_items_scraped', '這次寫入的資料點數',
+        Gauge('scrapy_items_scraped',
+              '本次取得筆數（未知時見 scrapy_items_unknown，勿逕自當 0 讀）',
               registry=registry).set(items)
     if success:
         # ★ 僅成功時設。失敗時**不推這個指標**，讓它保留上次成功的時間，
         #   存活告警才算得出「多久沒成功了」。
-        Gauge('scrapy_last_success_timestamp_seconds', '最後一次成功的時間',
+        Gauge('scrapy_last_success_timestamp_seconds',
+              '只有成功才推——存活告警看的是這個',
               registry=registry).set(run_ts)
 
     try:
