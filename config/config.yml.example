@@ -24,11 +24,10 @@ database:
     # ★ Cloud SQL 的**公開 IP**（Mac 不在 VPC 內，走不了 10.x 私有 IP）
     host: "35.221.64.187"
     port: 5432
-    # ★★ 必須用 dashboard 不是 crawler：monitor_power_load_curve 的
-    #    INSERT/UPDATE 權限**只授予 dashboard**（2026-08-05 實測，
-    #    crawler 連得上但寫入會 permission denied）。
-    #    家族慣例也是這樣：dashboard 庫用 dashboard 帳號存取。
-    user: "dashboard"
+    # ★ 帳號用 crawler：兩張表的擁有者（2026-09-12 實查 ACL），跟家族其他爬蟲一致。
+    #   dashboard 也有 INSERT/UPDATE，仍接受；其他帳號 config 載入時就會擋下。
+    #   （舊註解「必須用 dashboard」是舊庫 dashboard_monitor 時代的事，已不成立。）
+    user: "crawler"
     password: "CHANGE_ME"
     # ★ 2026-08-06 起 monitor 這幾張表搬到 strait_info_monitor_prod
     #   （原本是 dashboard_monitor，那邊的資料留著沒刪）。

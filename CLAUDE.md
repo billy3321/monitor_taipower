@@ -18,7 +18,7 @@
 dashboard-app 只負責讀取顯示。
 
 ★ 專案已經實作完成並在跑（2026-08-05 上線）。接手時要改東西，先跑
-`./venv/bin/pytest -q`（135 條）與 `scripts/verify_fixtures.py` 確認基準線是綠的，
+`./venv/bin/pytest -q`（142 條）與 `scripts/verify_fixtures.py` 確認基準線是綠的，
 改完再跑一次。**負向對照**（見「測試」節）不是選配。
 
 ## ★★ 欄位對應：這是本專案最容易錯的地方
@@ -545,8 +545,12 @@ FROM monitor_fetch_run WHERE source_id='taipower_loadcurve'
 擁有與管理（已建好在正式庫），schema 見 `docs/SCHEMA.md`。
 這個專案只對**自己那兩張表** INSERT/UPDATE。
 
-★ 資料庫帳號用 **dashboard** 不是 crawler——這兩張表的寫入權限只授予 dashboard，
-  用 crawler 連得上但 INSERT 會 permission denied，而且錯誤要跑到很後面才看得到。
+★ 資料庫帳號用 **crawler**：兩張表與 sequence 的擁有者都是它（2026-09-12 實查
+  `strait_info_monitor_prod` 的 ACL），跟家族其他爬蟲一致。dashboard 另有
+  INSERT/UPDATE，`config.py` 兩個都接受，其他帳號在載入 config 時就擋下——
+  否則錯誤要拖到很後面的 INSERT 才看得到。
+  ★ 2026-08-05 那句「crawler 會 permission denied」是在**舊庫 `dashboard_monitor`**
+    實測的，08-06 搬庫後就不成立了，卻一路留到 09-12 沒人回頭改。
 
 ★ 要加欄位得先跟表的擁有者講，由那邊開。不要因為「只是多一欄」就自己下 DDL。
 
@@ -586,7 +590,7 @@ naive datetime 進到 `timestamptz` 欄位，資料庫會拿連線的 `TimeZone`
 
 ## 測試
 
-現有 135 條（`./venv/bin/pytest -q`）。動到解析或抓取就要跑，而且至少要保住這幾條：
+現有 142 條（`./venv/bin/pytest -q`）。動到解析或抓取就要跑，而且至少要保住這幾條：
 
 1. 欄位對應（用 fixture，斷言燃氣/太陽能/風力等對到正確的值）
 2. **逐機組 API 按名字逐類對帳** ← 現在最有價值的一條（`test_column_verification.py`）

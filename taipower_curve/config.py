@@ -5,6 +5,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ROOT / 'config' / 'config.yml'
+ALLOWED_DB_USERS = ('crawler', 'dashboard')
 
 
 class ConfigError(Exception):
@@ -28,12 +29,15 @@ def database(cfg: dict[str, Any]) -> dict[str, Any]:
         raise ConfigError(f'config.yml 缺 database.{env}') from None
     if db.get('password') in (None, '', 'CHANGE_ME'):
         raise ConfigError('config.yml 的資料庫密碼還沒填')
-    # ★ monitor_power_load_curve 的寫入權限只授予 dashboard；用 crawler 連得上
-    #   但 INSERT 會 permission denied，而且錯誤發生在很後面才看得到。
-    if db.get('user') != 'dashboard':
+    # ★ 帳號限這兩個，其他的一律 fail-fast：兩張表的擁有者是 crawler（全部權限），
+    #   dashboard 另有 INSERT/UPDATE（2026-09-12 在 strait_info_monitor_prod 實查 ACL）。
+    #   拿到別的帳號，錯誤會拖到很後面的 INSERT 才出現，所以在這裡就擋。
+    #   ★ 舊註解「必須用 dashboard，crawler 會 permission denied」是 2026-08-05
+    #     在舊庫 dashboard_monitor 實測的，搬庫後不成立，別再抄回來。
+    if db.get('user') not in ALLOWED_DB_USERS:
         raise ConfigError(
-            f"資料庫帳號是 {db.get('user')!r}，但 monitor_power_load_curve 的寫入權限"
-            '只授予 dashboard——用別的帳號會 permission denied')
+            f"資料庫帳號是 {db.get('user')!r}，只接受 {ALLOWED_DB_USERS}"
+            '——crawler 是兩張表的擁有者，dashboard 另有寫入權限')
     return db
 
 

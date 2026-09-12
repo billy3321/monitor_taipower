@@ -212,6 +212,6 @@ def _permission_hint(exc: Exception) -> str:
     msg = str(exc)
     if 'permission denied' in msg.lower():
         return ('資料庫拒絕寫入（permission denied）——確認 config.yml 的帳號是 '
-                'dashboard 不是 crawler：這張表的寫入權限只授予 dashboard。'
+                'crawler（兩張表的擁有者）或 dashboard，且 ACL 沒被改過。'
                 f'原文：{msg[:160]}')
     return f'SQL 失敗（資料庫端，不是台電端）：{msg[:200]}'

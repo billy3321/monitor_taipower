@@ -51,7 +51,7 @@ Cloud SQL 的 **`strait_info_monitor_prod`**（2026-08-06 起；先前是 `dashb
 **第二個寫入者，但只寫自己的兩張表**——`monitor_power_load_curve` 與
 `monitor_fetch_run`。**一表一寫入者**是平台原則，不要跨線去寫別人的表。
 
-- 帳號用 **dashboard**（不是 crawler），只在這兩張表有寫入權限
+- 帳號用 **crawler**（兩張表的擁有者）；dashboard 也有寫入權限，程式兩個都接受
 - dashboard-app 只負責**讀取顯示**，不寫
 - 契約見 `docs/SCHEMA.md`
 
