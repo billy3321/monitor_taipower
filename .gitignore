@@ -5,6 +5,8 @@ config/config.yml
 # ★ 用 * 不用 *.pem：哪天憑證換成 .key/.crt 副檔名，也不能漏進 git。
 config/ssl/*
 !config/ssl/.gitkeep
+# 憑證打包檔（2026-09-12 曾出現 config/ssl.zip，內含 client-key.pem）
+config/*.zip
 
 # ── 本機資料 ─────────────────────────────────────────────────
 # 原文歸檔（data/raw/，90 天滾動，見 README）

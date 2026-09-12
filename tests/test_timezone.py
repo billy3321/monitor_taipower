@@ -129,3 +129,11 @@ def test_archive_prune_uses_taipei_date():
     src = (root / 'taipower_curve' / 'archive.py').read_text(encoding='utf-8')
     assert 'datetime.now(TAIPEI).date()' in src
     assert 'datetime.now().date()' not in src, '裸的 now() 會用系統時區'
+
+
+def test_tzdata_is_a_declared_dependency():
+    """★ Windows 沒有系統時區資料庫，ZoneInfo('Asia/Taipei') 要靠 tzdata 套件。
+    少了它，備援機在 import parser 那一刻就 ZoneInfoNotFoundError。"""
+    root = Path(__file__).resolve().parent.parent
+    reqs = (root / 'requirements.txt').read_text(encoding='utf-8')
+    assert 'tzdata' in reqs

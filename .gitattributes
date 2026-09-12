@@ -1,0 +1,16 @@
+# 換行一律 LF 進 git；Windows checkout 也不要轉成 CRLF。
+# ★ 這個專案會在 Windows 備援機上 checkout，而 Windows Git 預設 autocrlf=true。
+* text=auto eol=lf
+
+# ★ Windows 批次檔與 PowerShell 腳本例外：cmd.exe 對 LF 結尾的 .cmd 有已知的
+#   解析問題，這兩種在工作目錄一律 CRLF。
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# ★ fixture 是台電原文的 bytes（含 BOM 與原始換行），測試釘的是「當初對照出來
+#   的那一版是對的」。任何轉碼都會讓它不再是原文——完全不碰。
+tests/fixtures/** -text
+
+# 憑證與二進位
+*.pem -text
+*.bundle -text
