@@ -6,6 +6,12 @@
 **現況**：2026-08-05 上線，launchd 每小時跑一次，寫入 Cloud SQL。
 運維與排錯看「抓取健康度」與「確認它真的在做事」兩節。
 
+★ 2026-09-12 起多一台**備援**（Windows，`mode: backup`，每小時 :56）。
+主端那台 Mac 會睡著——9/12 從 05:55 停了九個小時，而健康頁上完全看不出來。
+備援每小時先查 `monitor_fetch_run`：最近 30 分鐘內有人成功就待命（不抓也不寫，
+只推遙測），沒有才接手。判斷邏輯見 CLAUDE.md 的「備援模式」，
+裝機見 `docs/DEPLOY.md` 第 7 節。
+
 ## 為什麼要一台獨立機器
 
 台電官網 `www.taipower.com.tw` 的 CloudFront **對整台主機封鎖雲端 ASN**。
@@ -94,6 +100,9 @@ cp config/config.yml.example config/config.yml   # 填密碼與 pushgateway
 ./venv/bin/pytest -q                             # 全部測試
 ./venv/bin/python scripts/run_once.py            # 正式跑一次
 ```
+
+備援機（Windows）的裝法不一樣（venv 路徑、`tzdata`、`PYTHONUTF8`、
+工作排程器），見 `docs/DEPLOY.md` 第 7 節。
 
 `preflight.py` 與 `verify_fixtures.py` **不碰資料庫也不需要 config**，
 所以是排錯時第一個該跑的兩支。`verify_fixtures.py` 會印出兩支曲線的總和並比對。

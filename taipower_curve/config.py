@@ -37,6 +37,25 @@ def database(cfg: dict[str, Any]) -> dict[str, Any]:
     return db
 
 
+VALID_MODES = ('normal', 'backup')
+
+
+def mode(cfg: dict[str, Any], *, force_backup: bool = False) -> str:
+    """執行模式：normal 照常抓寫；backup 先看主端還活著沒有。
+
+    ★ 認不得的字串要**丟例外**，不可以默默退回 normal：`mode: backupp`
+      這種打錯字會讓一台以為自己在待命的機器每小時跟主端搶著抓，
+      而且 log 與畫面**看起來完全正常**——這個家族最常踩的形狀。
+    """
+    if force_backup:
+        return 'backup'
+    m = cfg.get('mode') or 'normal'
+    if m not in VALID_MODES:
+        raise ConfigError(
+            f'config.yml 的 mode={m!r} 認不得，只能是 {VALID_MODES} 其中之一')
+    return m
+
+
 def resolve_path(value: str) -> str:
     """config 裡的相對路徑是相對專案根，不是相對 cwd。"""
     p = Path(value)

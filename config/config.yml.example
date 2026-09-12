@@ -1,6 +1,23 @@
 # 複製為 config/config.yml 後填入實際密碼。config.yml 不進 git。
 environment: production
 
+# 執行模式：
+#   normal（預設）＝主端，照常抓寫。
+#   backup        ＝備援，先查 monitor_fetch_run：**除了自己以外**，這個來源
+#                   最近 30 分鐘內有人成功寫入就**不抓也不寫**（只推遙測），
+#                   沒有才接手。`--backup` 旗標可以強制，不必改 config。
+#                   ★「除了自己以外」不能省：備援 23:56 接手後，23:59 那個
+#                     收尾場次會看到自己三分鐘前那列而待命，於是每天固定
+#                     少掉當日最後那幾個點。見 CLAUDE.md「備援模式」。
+#
+# ★ backup 只在**另一台也抓得到台電**的機器上有意義。
+# ★★ 而且那台的 monitoring.instance_id 必須跟主端不同，否則兩台共用同一個
+#    grouping key，備援的 last_success 會蓋掉主端的——**主端死掉會隱形**。
+# ★ 備援的排程要**比主端晚一分鐘**（主端 :55 → 備援 :56），錯開時間必須
+#   小於上面那 30 分鐘的窗、而窗又必須小於執行間隔 60 分鐘。
+#   三者綁在一起，見 scripts/run_once.py 的 BACKUP_WINDOW。
+mode: normal
+
 database:
   production:
     driver: "postgresql"

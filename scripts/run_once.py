@@ -11,7 +11,8 @@ launchd 每小時跑一次（deployment/tw.nics.taipower-curve.plist）。
   - 程式自己爆掉             → 最外層還是會推遙測（errors>0），
     否則「爬蟲壞了」會長得跟「機器關機了」一樣，兩者要修的東西完全不同。
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import argparse
 import logging
 import sys
 import time
@@ -28,8 +29,55 @@ from taipower_curve import parser as P                # noqa: E402
 
 log = logging.getLogger('run_once')
 
+# ★★ 備援模式：主端最近這麼久內有成功寫入，備援就不接手。
+#
+#   ★★ 這個數字被兩邊夾住，改任何一邊都要回來看另一邊：
+#
+#          排程錯開時間（1 分鐘） < BACKUP_WINDOW（30 分鐘） < 執行間隔（60 分鐘）
+#
+#      左邊那條：主端每小時 :55 跑，備援排在 :56（晚一分鐘）。窗要蓋得住這
+#      一分鐘，否則主端明明活著也會每小時被判成死了，兩台一起抓、一起寫，
+#      而且**看起來完全正常**。一分鐘夠不夠讓主端把 fetch_run 那列 commit
+#      完？實測 344 次執行：平均 6.7 秒、p95 7.9 秒、最久 24.7 秒——還有
+#      三十幾秒餘裕。**哪天 duration 開始逼近 60 秒，要查的是主端為什麼變慢，
+#      不是把錯開時間往後拉。**
+#
+#      右邊那條：窗不可以大於等於執行間隔，否則主端死掉時備援每次來看都還
+#      在窗內，**永遠不會接手**，而且待命得看起來完全正常。
+#
+#      ★ 錯開一分鐘的好處正是在午夜那一段：台電的檔 00:00 換日重置，主端
+#        23:55／23:59 沒跑成的話，備援 23:56／23:59 立刻補上——晚一個小時
+#        就是永久少掉當天最後那幾個點。
+#
+#   ★★ 查詢會把**自己寫的列排除掉**（db.backup_marker 打在 note 上的記號）。
+#      每小時 :56 的節奏下自己上次成功是 60 分鐘前、本來就落在窗外，看似多此
+#      一舉——是 **23:59 那個加班場次**讓它變成必要的：主端死掉的日子備援
+#      23:56 才剛接手成功，三分鐘後的 23:59（專門收當日最後那個 23:50 點的
+#      那一次）會看到自己 23:56 那列而待命不動，於是**每天固定少掉 23:50
+#      前後那幾個點，圖上看起來只像那時候沒用電**。
+BACKUP_WINDOW = timedelta(minutes=30)
 
-def main() -> int:
+
+def should_stand_down(last_success: datetime | None, now: datetime,
+                      window: timedelta = BACKUP_WINDOW) -> bool:
+    """備援這次要不要按兵不動。純函式、不碰資料庫，所以測得起來。
+
+    ★★ last_success 是 None（這個來源從來沒有成功過）時**要接手**——
+       「未知」不是「剛剛成功」。這跟 state.unverified_for 回 None 的立場
+       是同一條：未知≠零、也≠沒事。反過來寫的話，第一次部署的備援會
+       永遠待命，而且待命得**看起來完全正常**。
+    """
+    if last_success is None:
+        return False
+    return now - last_success < window
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description='台電今日用電曲線中繼爬蟲，跑一次。')
+    ap.add_argument('--backup', action='store_true',
+                    help='強制備援模式（覆蓋 config.yml 的 mode）：主端最近 '
+                         '30 分鐘內有成功就不抓也不寫，只推遙測。')
+    args = ap.parse_args(argv)
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s %(levelname)s %(name)s: %(message)s',
@@ -43,7 +91,8 @@ def main() -> int:
 
     try:
         cfg = cfgmod.load()
-        status, items, errors = _run(cfg, now, started)
+        status, items, errors = _run(cfg, now, started,
+                                     force_backup=args.backup)
     except Exception as exc:                          # noqa: BLE001
         # ★ 最外層防線：任何沒預期到的例外都不能讓這支「安靜地死掉」。
         log.exception('未預期的例外，這次執行失敗：%s', exc)
@@ -61,14 +110,47 @@ def main() -> int:
 
     log.info('結束：status=%s items=%d errors=%d %.1fs',
              status, items, errors, time.monotonic() - started)
-    return 0 if status == 'ok' else 1
+    # ★ standby（備援待命）是**成功的結果**，不是失敗：這次該做的事就是
+    #   什麼都不做。回非零會讓排程器與人都誤以為出事了。
+    return 0 if status in ('ok', 'standby') else 1
 
 
-def _run(cfg: dict, now: datetime, started: float) -> tuple[str, int, int]:
+def _run(cfg: dict, now: datetime, started: float, *,
+         force_backup: bool = False) -> tuple[str, int, int]:
     errors = 0
     items = 0
     note_parts: list[str] = []
     points: list[P.Point] = []
+
+    # ★ create_engine 只組 URL、不連線，所以擺在最前面不會多花一次往返；
+    #   備援模式的第一件事就要問資料庫，所以引擎必須在抓取之前就備妥。
+    engine = db.make_engine(cfg)
+
+    # ── 0. 備援模式：主端還活著就不要跟它搶 ───────────────────────
+    #
+    # ★★ 備援存在的意義是「主端死掉時有人補位」，不是「兩台一起抓」。
+    #    所以第一件事是查 monitor_fetch_run：主端最近 BACKUP_WINDOW 內有
+    #    成功，這次就**一個請求都不發、一列都不寫**（爬取自律，而且重複寫入
+    #    同一份資料只會讓健康頁上兩台互相蓋來蓋去，看不出誰死了）。
+    #
+    # ★ 查不到（連不上資料庫）→ 讓 DatabaseError 往外丟，由最外層記成失敗。
+    #   **刻意不 fail-open 去抓**：連資料庫都問不到的時候，抓回來也寫不進去，
+    #   那只是拿台電的頻寬去證明我們的資料庫壞了。而且這一類失敗（DB 端）
+    #   與「抓不到台電」要修的東西完全不同，訊息已經在 DatabaseError 裡分好。
+    if cfgmod.mode(cfg, force_backup=force_backup) == 'backup':
+        # ★ 同一個記號兩用：查詢時用來排除自己寫的列，接手時打在 note 上。
+        marker = db.backup_marker(_instance_id(cfg))
+        last_ok = db.last_success_at(engine, marker)
+        if should_stand_down(last_ok, now):
+            log.info('備援待命：別人 %s 才成功過（%s 內），這次不抓也不寫——'
+                     '這是正常結果，不是失敗', last_ok, BACKUP_WINDOW)
+            return 'standby', 0, 0
+        log.warning('備援接手：除了自己以外最後一次成功是 %s（超過 %s）'
+                    '——這次照常抓寫',
+                    last_ok if last_ok else '（從來沒有）', BACKUP_WINDOW)
+        # ★ 在 note 留下是哪一台接手的。這張表沒有「誰寫的」欄位，健康頁上
+        #   備援寫的列跟主端寫的列長得一模一樣——查事情的人分不出來。
+        note_parts.append(marker)
 
     # ── 1. 抓 ────────────────────────────────────────────────────
     result = fetch.fetch_all(cfg['crawler']['user_agent'],
@@ -258,7 +340,6 @@ def _run(cfg: dict, now: datetime, started: float) -> tuple[str, int, int]:
     # ── 5. 寫入 ──────────────────────────────────────────────────
     kinds = {p.kind for p in points}
     curve_times = sorted({p.observed_at for p in points})
-    engine = db.make_engine(cfg)
     items = 0
     failed_rows = 0
     write_failed = False
@@ -317,6 +398,10 @@ def _run(cfg: dict, now: datetime, started: float) -> tuple[str, int, int]:
         errors += 1
         status = 'error'
     return status, items, errors
+
+
+def _instance_id(cfg: dict) -> str:
+    return (cfg.get('monitoring') or {}).get('instance_id', 'unknown')
 
 
 if __name__ == '__main__':

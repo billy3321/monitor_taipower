@@ -25,7 +25,10 @@ def push(cfg: dict, *, run_ts: float, status: str, items: int,
          errors: int, duration: float) -> None:
     """推一次遙測。★ 失敗的執行也要推——沒有遙測 = 爬蟲死了沒人知道。
 
-    status: 'ok' / 'no_coverage' / 'error'（與 monitor_fetch_run 同語意）。
+    status: 'ok' / 'no_coverage' / 'error'（與 monitor_fetch_run 同語意），
+    外加 'standby'——備援模式判定主端還活著而**沒有抓也沒有寫**的那一次。
+    standby 不會寫進 monitor_fetch_run（那張表記的是這個來源的抓取，
+    待命沒有抓），所以遙測是備援待命時**唯一**的存在證明。
     """
     mon = (cfg.get('monitoring') or {})
     pg = (mon.get('pushgateway') or {})
@@ -38,7 +41,14 @@ def push(cfg: dict, *, run_ts: float, status: str, items: int,
         log.warning('遙測 URL 沒設好（%s），跳過推送', url or '空')
         return
 
-    success = status == 'ok'
+    # ★★ standby 算成功：備援待命時「什麼都不做」就是這次該有的結果。
+    #    而且**一定要推 last_success**——不推的話，一台長期待命（＝主端一直
+    #    很健康）的備援，它的 last_success 序列根本不存在，
+    #    `time() - scrapy_last_success_timestamp_seconds > 門檻` 是對空向量
+    #    求值，**永遠不會燒**。那等於「備援機器自己死掉」完全沒有人知道，
+    #    正是 pushadd 那條教訓的同一個形狀（見上）。
+    standby = status == 'standby'
+    success = status in ('ok', 'standby')
     # ★ 標準 #3：未知≠零。error 且一筆都沒寫成時，筆數是「未知」——
     #   推 items_scraped=0 會被讀成「來源真的沒東西」，意義完全相反。
     #   此時不推 items_scraped（留上次的值），改推 items_unknown=1。
@@ -59,12 +69,18 @@ def push(cfg: dict, *, run_ts: float, status: str, items: int,
     Gauge('scrapy_max_stale_seconds',
       '這個來源自己宣告多久沒成功算太舊（告警門檻用這個，不要另外寫死）',
           registry=registry).set(MAX_STALE_SECONDS)
-    Gauge('scrapy_items_unknown', '1＝筆數未知（抓取失敗），0＝確實是那個數字',
-          registry=registry).set(0 if items_known else 1)
-    if items_known:
-        Gauge('scrapy_items_scraped',
-              '本次取得筆數（未知時見 scrapy_items_unknown，勿逕自當 0 讀）',
-              registry=registry).set(items)
+    # ★★ standby 時**兩個筆數指標都不推**。待命這次沒有去抓，所以筆數
+    #    既不是 0（那是「來源確實沒東西」）也不是「未知」（那是「抓失敗了」）
+    #    ——這一次根本沒有「筆數」這件事。硬推任何一個都是在說謊。
+    #    代價是這兩個指標會停在上一次真的有抓的值（pushadd 的已知取捨），
+    #    判讀時要配著 last_run 看：待命期間它們本來就不會動。
+    if not standby:
+        Gauge('scrapy_items_unknown', '1＝筆數未知（抓取失敗），0＝確實是那個數字',
+              registry=registry).set(0 if items_known else 1)
+        if items_known:
+            Gauge('scrapy_items_scraped',
+                  '本次取得筆數（未知時見 scrapy_items_unknown，勿逕自當 0 讀）',
+                  registry=registry).set(items)
     if success:
         # ★ 僅成功時設。失敗時**不推這個指標**，讓它保留上次成功的時間，
         #   存活告警才算得出「多久沒成功了」。
@@ -83,6 +99,8 @@ def push(cfg: dict, *, run_ts: float, status: str, items: int,
                           'spider': SPIDER},
             timeout=PUSH_TIMEOUT)
         log.info('遙測已推送到 %s（status=%s items=%s errors=%d）',
-                 url, status, items if items_known else '未知', errors)
+                 url, status,
+                 '待命未抓' if standby else (items if items_known else '未知'),
+                 errors)
     except Exception as exc:                      # noqa: BLE001 — 推送失敗不該中斷爬蟲
         log.warning('遙測推送失敗（不影響爬取）：%s — %s', type(exc).__name__, exc)

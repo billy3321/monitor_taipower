@@ -103,3 +103,71 @@ GROUP BY 1 ORDER BY 1;
 
 更完整的對帳 SQL（斷點偵測、每次執行的結果）與四種失敗的分辨方式，
 見 README 的「確認它真的在做事」與「抓取健康度」兩節。
+
+## 7. 備援機（Windows）
+
+★ 主端是那台 Mac。這一節講的是**第二台**——`config.yml` 設 `mode: backup`，
+  主端活著就待命、死了才接手。判斷邏輯與那三個綁在一起的數字見 CLAUDE.md
+  的「備援模式」。這裡只講 Windows 這台怎麼裝。
+
+```powershell
+py -3.13 -m venv venv
+.\venv\Scripts\python.exe -m pip install -r requirements.txt
+copy config\config.yml.example config\config.yml   # 填密碼、pushgateway
+# 憑證三個檔放進 config\ssl\（server-ca.pem / client-cert.pem / client-key.pem）
+$env:PYTHONUTF8=1; .\venv\Scripts\python.exe scripts\preflight.py
+$env:PYTHONUTF8=1; .\venv\Scripts\python.exe -m pytest -q
+powershell -ExecutionPolicy Bypass -File deployment\register_backup_task.ps1
+```
+
+`config.yml` 要改兩個地方：`mode: backup`，以及 **`instance_id` 換成跟主端
+不同的字串**（這台是 `win-relay-02`）。後者不改的話兩台共用同一個 grouping
+key，備援的 `last_success` 會蓋掉主端的——**主端死掉會隱形**。
+
+排程是兩個工作：`TaipowerCurveBackup`（每小時 `:56`）與
+`TaipowerCurveBackupMidnight`（`23:59`）。移除用
+`register_backup_task.ps1 -Unregister`。日誌在 `data\backup-run.log`。
+
+### ★ Windows 特有的四個坑（四個都踩過）
+
+1. **`tzdata`**。Windows 沒有系統 tz 資料庫，`ZoneInfo('Asia/Taipei')` 直接丟
+   `ZoneInfoNotFoundError`，整組測試連 collect 都過不了。已經列進
+   `requirements.txt`。
+
+2. **`PYTHONUTF8=1`**。這台主控台是 cp932，Python 的 stdout 跟著用 cp932，
+   log 裡第一個中文字就 `UnicodeEncodeError` 把整次執行打掉——看起來像
+   「爬蟲壞了」，其實只是印不出字。`deployment\run_backup.cmd` 已經設好。
+
+3. **`.cmd` 必須純 ASCII（註解也是）**。cmd.exe 把批次檔當成 OEM 代碼頁的
+   原始位元組讀，UTF-8 中文在 `rem` 行會解成把換行吃掉的位元組對，
+   cmd 於是去執行半句註解，整個腳本死在
+   `is not recognized as an internal or external command`。
+
+4. **`.ps1` 必須存成 UTF-8 with BOM**。Windows PowerShell 5.1 沒看到 BOM
+   就當系統 ANSI 讀，中文變亂碼後在某個位元組上把引號吃掉，報的是
+   `The string is missing the terminator`——看起來像語法錯，其實是編碼。
+
+### ★ 時間：先校時，而且時區必須是台北
+
+備援的判斷是**拿本機時間去跟資料庫的 `fetched_at` 比**，時鐘偏掉就會判錯
+（偏快→以為主端死了而搶著抓；偏慢→以為主端還活著而不接手）。
+
+```powershell
+Get-TimeZone                 # 要是 Taipei Standard Time
+w32tm /resync /force
+```
+
+★ 工作排程器跟著**系統時區**跑。時區錯掉的話 `23:59` 那一次會跑在錯的時刻，
+  而檔案 00:00 換日重置，當天最後那幾個點就永久遺失——圖上看起來只像
+  「那時候沒用電」。`register_backup_task.ps1` 註冊前會擋下非台北時區。
+
+### ★ 睡眠與登入：跟 Mac 那節同一個問題
+
+工作已經設了 `-WakeToRun -StartWhenAvailable`，但機器關機時排程不會跑，
+開機後也只補跑一次。夜間睡著最貴（`23:56`／`23:59` 補不回來），
+白天漏掉則由當日累積檔補齊。
+
+★ 工作是用 `-LogonType Interactive` 註冊的，所以**只有使用者登入時才會跑**。
+  重開機後沒登入就一次都不會跑，而且工作排程器上看起來一切正常（狀態
+  還是 Ready）。要讓它在沒登入時也跑，得改成 `-LogonType Password` 並輸入
+  密碼（或 S4U，需要權限）——那是另一個決定，不要順手改。

@@ -47,6 +47,38 @@ VALUES (:source_id, :fetched_at, :status, :record_count, :data_timestamp,
 """)
 
 
+BACKUP_NOTE_PREFIX = '備援'
+
+
+def backup_marker(instance_id: str) -> str:
+    """備援接手時打在 note 最前面的記號。
+
+    ★★ 它同時是**兩件事**：給人看的「這列是備援寫的」，以及給程式看的
+       「這列是我自己寫的，不算數」。兩邊必須是同一個字串，所以只有這一個
+       定義處——寫成兩份遲早漂移，而漂移之後備援會把自己的列當成主端的，
+       然後**永遠不接手**，且看起來完全正常。
+    """
+    return f'{BACKUP_NOTE_PREFIX}({instance_id})'
+
+
+# ★ 備援模式唯一要問資料庫的事：「**除了我以外**，最近有沒有人成功寫進來」。
+#
+# ★★ `NOT LIKE :own_marker` 這一段不是潔癖，是 23:59 那一次的命脈：
+#    主端死掉的日子，備援 23:56 接手成功、寫下一列；三分鐘後的 23:59
+#    （專門用來收當日最後那個 23:50 點的那一次）如果把自己 23:56 那列
+#    也算成「最近有人成功」，就會待命不動——於是**每天固定少掉 23:50
+#    前後那幾個點，而且圖上看起來只像那時候沒用電**。
+#    這正是 CLAUDE.md 排程那一節花了一整段消滅的形狀。
+#    每小時 :56 的節奏下自己上次成功是 60 分鐘前、本來就落在窗外，
+#    是 23:59 這個加班場次讓「自己也算數」變成錯的。
+_LAST_SUCCESS = text("""
+SELECT max(fetched_at) FROM monitor_fetch_run
+ WHERE source_id = :source_id
+   AND status IN ('ok', 'no_coverage')
+   AND (note IS NULL OR note NOT LIKE :own_marker)
+""")
+
+
 class DatabaseError(Exception):
     """★ 與「抓不到台電」是兩種完全不同的失敗，訊息要分清楚，
     否則會叫人去修錯的東西（見 docs/DEPLOY.md）。"""
@@ -148,6 +180,32 @@ def insert_fetch_run(engine: Engine, *, fetched_at: datetime, status: str,
     except Exception as exc:
         raise DatabaseError(f'寫 monitor_fetch_run 失敗（資料庫端，不是台電端）：'
                             f'{type(exc).__name__} — {str(exc)[:200]}') from exc
+
+
+def last_success_at(engine: Engine, own_marker: str) -> datetime | None:
+    """**別人**最後一次成功寫入這個來源是什麼時候。一次都沒有回 None。
+
+    own_marker 是 backup_marker() 產生的記號，帶這個開頭的列是自己寫的，
+    不算數（理由見 _LAST_SUCCESS 上面那段：23:59 那一次會被自己擋住）。
+
+    ★ `no_coverage` 也算成功：它的意思是「抓到了也寫得進，只是來源當下
+      還沒有東西」（例如剛過午夜那一次）。主端在那個狀態下是活著的，
+      備援接手去抓也一樣拿不到東西。只有 `error` 才代表主端沒做到事。
+
+    ★★ 回 None 是「從來沒成功過」**不是「剛剛成功」**——呼叫端要當成
+       「主端不在」而接手。跟 state.unverified_for 回 None 同一個立場：
+       未知≠零，也≠沒事。
+    """
+    try:
+        with engine.connect() as conn:
+            return conn.execute(
+                _LAST_SUCCESS,
+                {'source_id': SOURCE_ID, 'own_marker': own_marker + '%'}).scalar()
+    except Exception as exc:
+        raise DatabaseError(
+            f'查不到 monitor_fetch_run 的最後成功時間，備援無從判斷該不該接手'
+            f'（資料庫端，不是台電端）：{type(exc).__name__} — {str(exc)[:200]}'
+        ) from exc
 
 
 def _permission_hint(exc: Exception) -> str:

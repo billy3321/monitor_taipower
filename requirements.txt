@@ -4,3 +4,7 @@ psycopg2-binary>=2.9
 PyYAML>=6.0
 prometheus-client>=0.20
 pytest>=8.0
+# ★ Windows 沒有系統 tz 資料庫，ZoneInfo('Asia/Taipei') 會直接丟
+#   ZoneInfoNotFoundError（整組測試連 collect 都過不了）。mac/Linux 裝了
+#   也無害，所以直接列進來，不要靠備援那台自己記得補裝。
+tzdata>=2024.1
