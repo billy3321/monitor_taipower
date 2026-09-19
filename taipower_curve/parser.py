@@ -11,7 +11,8 @@ import io
 import json
 
 # 改欄位對應時要跟著改（會寫進 monitor_power_load_curve.parser_version）
-PARSER_VERSION = '2026-08-06.1'
+# 2026-09-19.1：genloadareaperc 多派生一種 kind='area_net'（發電−用電）
+PARSER_VERSION = '2026-09-19.1'
 
 # ★ 台電時戳是台北時間且不帶時區，組 observed_at 時必須補上時區。
 #
@@ -104,7 +105,7 @@ class ParseError(Exception):
 @dataclass(frozen=True)
 class Point:
     observed_at: datetime   # aware，+08:00
-    kind: str               # fuel / area / area_gen / area_load
+    kind: str               # fuel / area / area_gen / area_load / area_net
     label: str
     mw: float | None        # NULL=未報告，0=真的零出力
 
@@ -195,8 +196,22 @@ def parse_areaperc(body: bytes) -> tuple[list[Point], date | None]:
                 f'（來源可能改版了）：{row!r}')
         stamp = _parse_full_timestamp(row[0])
         base_date = stamp.date()
+        by_label: dict[str, dict[str, float | None]] = {}
         for (kind, label), cell in zip(PERC_COLUMNS, row[1:]):
-            points.append(Point(stamp, kind, label, parse_number(cell)))
+            mw = parse_number(cell)
+            points.append(Point(stamp, kind, label, mw))
+            by_label.setdefault(label, {})[kind] = mw
+        # ★ area_net＝各區「發電−用電」（2026-09-19，dashboard 能源頁的即時區域
+        #   供需平衡就靠這個）。負值＝淨受電（北部平日 -1,500~-2,500）、正值＝淨送出
+        #   （南部）。四區加總理論上是 0（差的是線損與四捨五入，實測 ±數 MW）。
+        #   ★ 為什麼在爬蟲側算而不是讀取端算：這是「一條規則一份」——dashboard、
+        #     MCP、日後任何消費者讀同一欄，不會各自減出不同的數。
+        #   ★ 任一邊是 NULL 就不派生（未知≠零，不要憑空多出一個 0）。
+        for label, kv in by_label.items():
+            gen, load = kv.get('area_gen'), kv.get('area_load')
+            if gen is None or load is None:
+                continue
+            points.append(Point(stamp, 'area_net', label, round(gen - load, 1)))
     return points, base_date
 
 

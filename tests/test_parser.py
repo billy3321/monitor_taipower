@@ -217,7 +217,7 @@ def test_future_slots_produce_no_zero_points(fuel):
 def test_areaperc_splits_into_gen_and_load():
     pts, base = P.parse_areaperc(read('genloadareaperc.csv'))
     assert base == BASE_DATE
-    assert len(pts) == 8
+    assert len(pts) == 12     # 4 區 ×（發電、用電、派生的淨值）
     got = {(p.kind, p.label): p.mw for p in pts}
     # 2026-08-05 12:20,1304.1,1481.5,990.9,1076.7,1514.9,1230.1,29.2,50.8
     assert got[('area_gen', '北部')] == 13041.0
@@ -228,6 +228,29 @@ def test_areaperc_splits_into_gen_and_load():
     assert got[('area_load', '南部')] == 12301.0
     assert got[('area_gen', '東部')] == 292.0
     assert got[('area_load', '東部')] == 508.0
+
+
+def test_areaperc_derives_area_net_as_gen_minus_load():
+    """★ area_net＝發電−用電，每區一筆，跟著同一個時戳。負＝淨受電、正＝淨送出。"""
+    pts, _ = P.parse_areaperc(read('genloadareaperc.csv'))
+    net = {p.label: p.mw for p in pts if p.kind == 'area_net'}
+    assert net == {'北部': -1774.0, '中部': -858.0, '南部': 2848.0, '東部': -216.0}
+    # 四區加總≈0：差的是線損與四捨五入。這條檢查「派生沒有算錯邊」——
+    # 例如把某一區的減法寫反，加總會差幾千 MW
+    assert abs(sum(net.values())) < 50
+    assert {p.observed_at for p in pts if p.kind == 'area_net'} == \
+           {p.observed_at for p in pts if p.kind == 'area_gen'}
+
+
+def test_areaperc_area_net_skipped_when_either_side_missing():
+    """未知≠零：發電或用電任一邊是空的，就不派生淨值（不要憑空多出一個 0）"""
+    body = read('genloadareaperc.csv').decode('utf-8')
+    # 把北部用電（第 2 個數值欄）挖空
+    first = body.strip().splitlines()[0].split(',')
+    first[2] = ''
+    pts, _ = P.parse_areaperc(','.join(first).encode('utf-8'))
+    net = {p.label for p in pts if p.kind == 'area_net'}
+    assert '北部' not in net and {'中部', '南部', '東部'} <= net
 
 
 def test_areaperc_flow_directions_match_reality():
@@ -257,8 +280,8 @@ def test_parse_all_uses_date_from_areaperc():
     pts = P.parse_all(read('loadfueltype.csv'), read('loadareas.csv'),
                       read('genloadareaperc.csv'))
     assert {p.observed_at.date() for p in pts} == {BASE_DATE}
-    assert {p.kind for p in pts} == {'fuel', 'area', 'area_gen', 'area_load'}
-    assert len(pts) == 75 * 12 + 75 * 4 + 8
+    assert {p.kind for p in pts} == {'fuel', 'area', 'area_gen', 'area_load', 'area_net'}
+    assert len(pts) == 75 * 12 + 75 * 4 + 12
 
 
 def test_parse_all_falls_back_to_taipei_today_without_areaperc():
@@ -268,5 +291,5 @@ def test_parse_all_falls_back_to_taipei_today_without_areaperc():
 
 def test_parse_all_tolerates_missing_files():
     pts = P.parse_all(None, read('loadareas.csv'), read('genloadareaperc.csv'))
-    assert {p.kind for p in pts} == {'area', 'area_gen', 'area_load'}
+    assert {p.kind for p in pts} == {'area', 'area_gen', 'area_load', 'area_net'}
     assert P.cross_check(pts) is None, '缺能源別時無法交叉檢查'

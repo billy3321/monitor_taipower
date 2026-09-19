@@ -79,9 +79,9 @@ def test_every_point_observed_at_is_aware(all_points):
 
 
 def test_every_kind_is_aware(all_points):
-    """四種 kind 走的是不同的解析路徑，每一條都要驗到。"""
+    """每種 kind 走的是不同的解析路徑（area_net 是從 area_gen/area_load 派生），每一條都要驗到。"""
     kinds = {p.kind for p in all_points}
-    assert kinds == {'fuel', 'area', 'area_gen', 'area_load', 'capacity'}
+    assert kinds == {'fuel', 'area', 'area_gen', 'area_load', 'area_net', 'capacity'}
     for kind in kinds:
         pts = [p for p in all_points if p.kind == kind]
         assert pts

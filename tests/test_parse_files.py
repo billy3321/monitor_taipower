@@ -22,7 +22,7 @@ def test_all_good_no_errors():
     points, errors = P.parse_files(good_bodies())
     assert errors == []
     assert {p.kind for p in points} == {'fuel', 'area', 'area_gen',
-                                        'area_load', 'capacity'}
+                                        'area_load', 'area_net', 'capacity'}
 
 
 def test_broken_loadpara_does_not_kill_curves():
@@ -65,7 +65,7 @@ def test_two_broken_files_two_errors():
     bodies['loadpara.json'] = b'not json at all'
     bodies['loadareas.csv'] = b'00:10,1.0\n'
     points, errors = P.parse_files(bodies)
-    assert {p.kind for p in points} >= {'fuel', 'area_gen', 'area_load'}
+    assert {p.kind for p in points} >= {'fuel', 'area_gen', 'area_load', 'area_net'}
     assert len(errors) == 2
 
 
