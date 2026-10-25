@@ -59,7 +59,7 @@ if ($Unregister) {
 
 if (-not (Test-Path $cmd)) { throw "找不到 $cmd" }
 if (-not (Test-Path (Join-Path $proj 'venv\Scripts\python.exe'))) {
-    throw '找不到 venv——先跑 py -3.13 -m venv venv 並安裝 requirements.txt'
+    throw '找不到 venv——先跑 py -3.14 -m venv venv 並安裝 requirements.txt'
 }
 
 # ★ 時區必須是 Asia/Taipei：工作排程器照系統時區跑，而台電的檔是台北時間，

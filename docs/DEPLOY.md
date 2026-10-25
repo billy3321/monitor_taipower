@@ -111,7 +111,7 @@ GROUP BY 1 ORDER BY 1;
   的「備援模式」。這裡只講 Windows 這台怎麼裝。
 
 ```powershell
-py -3.13 -m venv venv
+py -3.14 -m venv venv
 .\venv\Scripts\python.exe -m pip install -r requirements.txt
 copy config\config.yml.example config\config.yml   # 填密碼、pushgateway
 # 憑證三個檔放進 config\ssl\（server-ca.pem / client-cert.pem / client-key.pem）
