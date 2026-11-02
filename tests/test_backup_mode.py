@@ -230,12 +230,13 @@ def test_backup_flag_overrides_config(monkeypatch):
     assert status == 'standby' and fetched == []
 
 
-def test_db_unreachable_does_not_fail_open(monkeypatch):
-    """★★ 問不到資料庫就**不要去抓**。
+def test_db_unreachable_fetches_and_spools_instead_of_giving_up(monkeypatch):
+    """★★ 2026-11-02 反轉：問不到資料庫時**照常抓，結果離線暫存**。
 
-    連「該不該接手」都答不出來的時候，抓回來也寫不進去——那只是拿台電的
-    頻寬去證明我們的資料庫壞了。而且這一類失敗（DB 端）跟「抓不到台電」
-    要修的東西完全不同，混在一起會叫人去修錯的東西。
+    原本是「不抓」（不可以 fail-open），理由是「抓回來也寫不進去」。有了
+    離線暫存（spool.py）之後這個理由不成立：抓回來的東西先存著、連得上再
+    回傳（只補缺、不覆寫）。不抓的代價則是主端也死掉的那幾天，跨過午夜的
+    點永久遺失。完整的暫存行為見 tests/test_spool.py。
     """
     fetched: list = []
 
@@ -245,9 +246,9 @@ def test_db_unreachable_does_not_fail_open(monkeypatch):
 
     _patch(monkeypatch, Dead(None), fetched)
 
-    with pytest.raises(RuntimeError):
-        run_once._run(CFG, NOW, 0.0)
-    assert fetched == [], '★ 不可以 fail-open 去抓'
+    status, _, _ = run_once._run(CFG, NOW, 0.0)
+    assert fetched == [1], '問不到資料庫也要抓——結果離線暫存'
+    assert status == 'error', '資料沒送達就是失敗，告警要燒'
 
 
 # ── config 的 mode ─────────────────────────────────────────────

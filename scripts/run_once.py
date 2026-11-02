@@ -7,7 +7,8 @@ launchd 每小時跑一次（deployment/tw.nics.taipower-curve.plist）。
 失敗分級（★ 幾種失敗長得完全不一樣，訊息要讓人一眼分清楚）：
   - 抓不到台電（403/HTML/逾時）→ 台電端。status='error'，record_count=NULL。
   - 連不上資料庫             → DB 端（IP 沒授權？憑證權限？）。
-    fetch_run 也寫不了，至少把遙測推出去。
+    這次的點與 fetch_run 離線暫存到 data/spool/，下次連得上自動回傳
+    （只補缺不覆寫，見 taipower_curve/spool.py）；這次仍記成失敗、照推遙測。
   - 程式自己爆掉             → 最外層還是會推遙測（errors>0），
     否則「爬蟲壞了」會長得跟「機器關機了」一樣，兩者要修的東西完全不同。
 """
@@ -22,6 +23,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))               # launchd 的 cwd 是專案根，但保險起見
 
 from taipower_curve import archive                   # noqa: E402
+from taipower_curve import spool                     # noqa: E402
 from taipower_curve import state                     # noqa: E402
 from taipower_curve import config as cfgmod           # noqa: E402
 from taipower_curve import db, fetch, telemetry       # noqa: E402
@@ -126,6 +128,16 @@ def _run(cfg: dict, now: datetime, started: float, *,
     #   備援模式的第一件事就要問資料庫，所以引擎必須在抓取之前就備妥。
     engine = db.make_engine(cfg)
 
+    # ── 0a. 先回傳之前的離線暫存（★ 由舊到新、在這次寫入之前——後抓的贏）──
+    #   暫存是空的就一次資料庫呼叫都不做。
+    # ★★ 回傳失敗**不可以**拿來推論「資料庫連不上」。回傳失敗也可能是某一個
+    #    暫存檔自己寫不進去（約束、權限）而資料庫好好的——若據此判成斷線，
+    #    這台之後每次都跳過寫入、把自己也暫存起來，log 每小時說「連不上」，
+    #    **一台健康的資料庫從此收不到這台的任何東西**。所以這次照常自己試，
+    #    真的斷線時多等幾次逾時，是可以接受的代價。
+    spool.flush(db, engine, now)
+    db_down = False
+
     # ── 0. 備援模式：主端還活著就不要跟它搶 ───────────────────────
     #
     # ★★ 備援存在的意義是「主端死掉時有人補位」，不是「兩台一起抓」。
@@ -133,24 +145,40 @@ def _run(cfg: dict, now: datetime, started: float, *,
     #    成功，這次就**一個請求都不發、一列都不寫**（爬取自律，而且重複寫入
     #    同一份資料只會讓健康頁上兩台互相蓋來蓋去，看不出誰死了）。
     #
-    # ★ 查不到（連不上資料庫）→ 讓 DatabaseError 往外丟，由最外層記成失敗。
-    #   **刻意不 fail-open 去抓**：連資料庫都問不到的時候，抓回來也寫不進去，
-    #   那只是拿台電的頻寬去證明我們的資料庫壞了。而且這一類失敗（DB 端）
-    #   與「抓不到台電」要修的東西完全不同，訊息已經在 DatabaseError 裡分好。
-    if cfgmod.mode(cfg, force_backup=force_backup) == 'backup':
+    # ★ 查不到（連不上資料庫）→ 照常抓，結果離線暫存（見下方 2026-11-02 那段）。
+    is_backup = cfgmod.mode(cfg, force_backup=force_backup) == 'backup'
+    if is_backup:
         # ★ 同一個記號兩用：查詢時用來排除自己寫的列，接手時打在 note 上。
         marker = db.backup_marker(_instance_id(cfg))
-        last_ok = db.last_success_at(engine, marker)
-        if should_stand_down(last_ok, now):
+        last_ok = None
+        if not db_down:
+            try:
+                last_ok = db.last_success_at(engine, marker)
+            except db.DatabaseError as exc:
+                log.error('%s', exc)
+                db_down = True
+        if db_down:
+            # ★★ 2026-11-02 改：問不到資料庫時**照常抓、結果離線暫存**。
+            #    原本是「不抓，記成失敗」，理由是「抓回來也寫不進去」——
+            #    有了離線暫存之後這個理由不成立了。而不抓的代價是實打實的：
+            #    主端也死掉的那幾天（這台的 log 有 61 次問不到資料庫），
+            #    跨過午夜的點永久遺失。代價是主端其實活著時每小時多 4 個請求；
+            #    回傳時**只補缺不覆寫**（db.fill_missing_points），重複的舊資料
+            #    蓋不掉主端寫的新值。
+            log.warning('備援問不到資料庫，主端是否活著未知——照常抓，結果離線暫存')
+            note_parts.append(marker)
+            note_parts.append('主端狀態未知(資料庫連不上)')
+        elif should_stand_down(last_ok, now):
             log.info('備援待命：別人 %s 才成功過（%s 內），這次不抓也不寫——'
                      '這是正常結果，不是失敗', last_ok, BACKUP_WINDOW)
             return 'standby', 0, 0
-        log.warning('備援接手：除了自己以外最後一次成功是 %s（超過 %s）'
-                    '——這次照常抓寫',
-                    last_ok if last_ok else '（從來沒有）', BACKUP_WINDOW)
-        # ★ 在 note 留下是哪一台接手的。這張表沒有「誰寫的」欄位，健康頁上
-        #   備援寫的列跟主端寫的列長得一模一樣——查事情的人分不出來。
-        note_parts.append(marker)
+        else:
+            log.warning('備援接手：除了自己以外最後一次成功是 %s（超過 %s）'
+                        '——這次照常抓寫',
+                        last_ok if last_ok else '（從來沒有）', BACKUP_WINDOW)
+            # ★ 在 note 留下是哪一台接手的。這張表沒有「誰寫的」欄位，健康頁上
+            #   備援寫的列跟主端寫的列長得一模一樣——查事情的人分不出來。
+            note_parts.append(marker)
 
     # ── 1. 抓 ────────────────────────────────────────────────────
     result = fetch.fetch_all(cfg['crawler']['user_agent'],
@@ -337,66 +365,84 @@ def _run(cfg: dict, now: datetime, started: float, *,
             else:
                 log.info('即時供電檢查通過：即時用電與能源別合計差 %.0f MW', diff)
 
-    # ── 5. 寫入 ──────────────────────────────────────────────────
+    # ── 5. 寫入（資料庫連不上就離線暫存，下次回傳）──────────────────
     kinds = {p.kind for p in points}
     curve_times = sorted({p.observed_at for p in points})
     items = 0
     failed_rows = 0
-    write_failed = False
-    try:
-        items, failed_rows = db.upsert_points(engine, points, fetched_at=now)
-    except db.DatabaseError as exc:
-        # ★ 與「抓不到台電」是兩種完全不同的失敗，訊息已經在 DatabaseError 裡分好
-        log.error('%s', exc)
-        errors += 1
-        write_failed = True
-        note_parts.append('曲線寫入失敗')
+    if points and not db_down:
+        try:
+            items, failed_rows = db.upsert_points(engine, points, fetched_at=now)
+        except db.DatabaseError as exc:
+            # ★ 與「抓不到台電」是兩種完全不同的失敗，訊息已經在 DatabaseError 裡分好
+            log.error('%s', exc)
+            db_down = True
+    # ★ 暫存的那一列 fetch_run 記的是「這次**抓取**」的結果，所以筆數與狀態
+    #   照資料寫得進去的情況算（回傳時以實際寫入筆數更正）；「這次**送達**
+    #   失敗」則由遙測與結束碼表達（見下方 status='error'）。
+    n_rows = len(points) if db_down else items
     if failed_rows:
         # ★ 救回來不等於沒事：壞列數要看得見，該次狀態降為 error（標準 #6）
         errors += 1
         note_parts.append(f'壞列跳過 {failed_rows} 筆')
-    if items:
+    if n_rows:
         counts = {k: sum(1 for p in points if p.kind == k) for k in sorted(kinds)}
-        log.info('已 upsert %d 筆（%s）', items,
-                 '; '.join(f'{k}={v}' for k, v in counts.items()))
+        if not db_down:
+            log.info('已 upsert %d 筆（%s）', items,
+                     '; '.join(f'{k}={v}' for k, v in counts.items()))
         note_parts.append('; '.join(f'{k}={v}' for k, v in counts.items()))
     elif not points:
         note_parts.append('無資料')
 
-    if errors == 0 and items > 0:
+    if errors == 0 and n_rows > 0:
         status = 'ok'
-    elif errors == 0 and items == 0:
+    elif errors == 0 and n_rows == 0:
         status = 'no_coverage'              # 抓到了但整天還沒有任何有值時點
     else:
         status = 'error'
 
     # record_count 的語意（寫錯會讓監控說謊）：寫入路徑有完成就是實際筆數
-    # （含 no_coverage 的 0 與逐列退回的部分筆數）；抓/解析失敗到沒東西可寫、
-    # 或寫入本身失敗 → NULL（筆數未知，不是 0）。
-    if write_failed or (status == 'error' and not points):
-        record_count = None
-    else:
-        record_count = items
+    # （含 no_coverage 的 0 與逐列退回的部分筆數）；抓/解析失敗到沒東西可寫
+    # → NULL（筆數未知，不是 0）。
+    record_count = None if (status == 'error' and not points) else n_rows
 
     # ★★ 每次執行都要寫一筆 fetch_run，失敗也要寫——而且**與資料不同交易**
     #    （標準 #5，msil 教訓）：資料那筆交易 rollback 時，「我失敗了」這筆
     #    紀錄不能陪葬，否則壞掉的來源在健康頁上長得跟正常的一模一樣。
-    try:
-        db.insert_fetch_run(
-            engine, fetched_at=now, status=status,
-            record_count=record_count,
-            data_timestamp=curve_times[-1] if curve_times else None,
-            span_lo=curve_times[0] if curve_times else None,
-            span_hi=curve_times[-1] if curve_times else None,
-            http_status=http_status,
-            duration_ms=int((time.monotonic() - started) * 1000),
-            note='; '.join(note_parts)[:500],
-            raw_uri=raw_uri, raw_sha256=raw_sha)
-        log.info('fetch_run 已記錄：status=%s record_count=%s', status, record_count)
-    except db.DatabaseError as exc:
-        log.error('fetch_run 寫不進去（健康頁會看不到這次執行）：%s', exc)
+    run_kw = dict(
+        fetched_at=now, status=status,
+        record_count=record_count,
+        data_timestamp=curve_times[-1] if curve_times else None,
+        span_lo=curve_times[0] if curve_times else None,
+        span_hi=curve_times[-1] if curve_times else None,
+        http_status=http_status,
+        duration_ms=int((time.monotonic() - started) * 1000),
+        note='; '.join(note_parts)[:500],
+        raw_uri=raw_uri, raw_sha256=raw_sha)
+    pending_points = points if db_down else []
+    if not db_down:
+        try:
+            db.insert_fetch_run(engine, **run_kw)
+            log.info('fetch_run 已記錄：status=%s record_count=%s',
+                     status, record_count)
+        except db.DatabaseError as exc:
+            log.error('fetch_run 寫不進去：%s', exc)
+            db_down = True
+    if db_down:
+        if is_backup and not points:
+            # 備援問不到資料庫、又什麼都沒抓到：多半是這台自己斷網了，
+            # 那不是「這個來源」的事，不該事後塞一列 error 進健康頁。
+            log.warning('備援既連不上資料庫也沒抓到資料——不暫存 fetch_run')
+        else:
+            try:
+                spool.save(run_kw, pending_points)
+            except Exception as exc:              # noqa: BLE001
+                log.error('離線暫存也失敗了，這次的資料遺失：%s — %s',
+                          type(exc).__name__, exc)
+        # ★ 資料沒有送達＝這次是失敗，告警要燒得起來（離線暫存不是「沒事」）
         errors += 1
         status = 'error'
+        items = 0
     return status, items, errors
 
 

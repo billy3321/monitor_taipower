@@ -32,6 +32,26 @@ ON CONFLICT (observed_at, kind, label) DO UPDATE
        fetched_at = EXCLUDED.fetched_at
 """
 
+# ★★ 離線暫存回傳（spool.py）專用：**只補缺，不覆寫**。
+#    資料庫裡已經有值的點一律不動——暫存是**舊的**抓取，那段期間主端（或
+#    之後的執行）可能已經寫了台電更正過的新值，舊暫存不可以把它蓋回去。
+#    只有兩種情況寫入：
+#      1. 資料庫根本沒有這一列（INSERT）
+#      2. 有這一列但 mw 是 NULL（未報告），而暫存裡有值（補上缺漏）
+#    反過來不成立：暫存是 NULL 時不會把資料庫的值洗成 NULL（未知≠零，也≠覆蓋）。
+#    RETURNING 1 是為了數「真的寫了幾列」——被 WHERE 擋下的衝突列不回傳。
+_FILL_CURVE = """
+INSERT INTO monitor_power_load_curve
+    (observed_at, kind, label, mw, parser_version, fetched_at)
+VALUES %s
+ON CONFLICT (observed_at, kind, label) DO UPDATE
+   SET mw = EXCLUDED.mw,
+       parser_version = EXCLUDED.parser_version,
+       fetched_at = EXCLUDED.fetched_at
+ WHERE monitor_power_load_curve.mw IS NULL AND EXCLUDED.mw IS NOT NULL
+RETURNING 1
+"""
+
 # ★ append-only：一次執行一列，不覆蓋不更新。
 #   CAST() 不能寫成 ::timestamptz——SQLAlchemy 的 text() 不把緊跟著冒號的
 #   :param 當參數（:span_lo:: 會原樣送出，資料庫端直接 syntax error）。
@@ -113,6 +133,20 @@ def upsert_points(engine: Engine, points: list[Point],
 
     兩條路都全滅（例如連線根本建不起來）才丟 DatabaseError。
     """
+    return _write(engine, points, fetched_at, _UPSERT_CURVE)
+
+
+def fill_missing_points(engine: Engine, points: list[Point],
+                        fetched_at: datetime) -> tuple[int, int]:
+    """離線暫存回傳用：只寫資料庫**沒有**的列、或 mw 是 NULL 的列。
+    回 (實際寫入筆數, 壞列數)；已經有值而被略過的不算在寫入筆數裡。
+    錯誤處理與 upsert_points 相同（整批 → 逐列退回 → 全滅才丟 DatabaseError）。
+    """
+    return _write(engine, points, fetched_at, _FILL_CURVE, returning=True)
+
+
+def _write(engine: Engine, points: list[Point], fetched_at: datetime,
+           sql: str, *, returning: bool = False) -> tuple[int, int]:
     if not points:
         return 0, 0
     from .parser import PARSER_VERSION
@@ -120,9 +154,9 @@ def upsert_points(engine: Engine, points: list[Point],
             for p in points]
     try:
         with engine.begin() as conn:       # begin() = 成功才 commit，例外自動 rollback
-            execute_values(conn.connection.cursor(), _UPSERT_CURVE, rows,
-                           page_size=500)
-        return len(rows), 0
+            out = execute_values(conn.connection.cursor(), sql, rows,
+                                 page_size=500, fetch=returning)
+        return (len(out) if returning else len(rows)), 0
     except Exception as exc:
         # raw cursor 丟的是 psycopg2 原生例外，不是 SQLAlchemy 包裝的
         log.warning('整批 upsert 失敗（%s — %s），退回逐列寫入',
@@ -135,9 +169,9 @@ def upsert_points(engine: Engine, points: list[Point],
             for row in rows:
                 cur.execute('SAVEPOINT row_sp')
                 try:
-                    execute_values(cur, _UPSERT_CURVE, [row])
+                    out = execute_values(cur, sql, [row], fetch=returning)
                     cur.execute('RELEASE SAVEPOINT row_sp')
-                    written += 1
+                    written += len(out) if returning else 1
                 except Exception as exc:
                     cur.execute('ROLLBACK TO SAVEPOINT row_sp')
                     failed += 1

@@ -52,7 +52,7 @@ cp config/config.yml.example config/config.yml   # 填密碼與 pushgateway
 **兩支曲線總和吻合**、**即時用電與能源別合計吻合**、寫入筆數、fetch_run 已記錄。
 
 ```bash
-./venv/bin/pytest -q                      # 142 條
+./venv/bin/pytest -q                      # 160 條
 ./venv/bin/python scripts/verify_fixtures.py
 ./venv/bin/python scripts/run_once.py
 ```
@@ -123,6 +123,14 @@ powershell -ExecutionPolicy Bypass -File deployment\register_backup_task.ps1
 `config.yml` 要改兩個地方：`mode: backup`，以及 **`instance_id` 換成跟主端
 不同的字串**（這台是 `win-relay-02`）。後者不改的話兩台共用同一個 grouping
 key，備援的 `last_success` 會蓋掉主端的——**主端死掉會隱形**。
+
+★ 這台常換網路（筆電）。在台電擋的網路（CloudFront 403）上它當不了備援，
+在連不到 Cloud SQL 的網路上它會照常抓、把結果**離線暫存**到 `data\spool\`，
+回到連得上的網路後下一次執行自動回傳（只補缺不覆寫）。查還有幾個沒回傳：
+
+```powershell
+dir data\spool                      # 空的＝都回傳了；*.bad 是讀不回來的壞檔，要人看
+```
 
 排程是兩個工作：`TaipowerCurveBackup`（每小時 `:56`）與
 `TaipowerCurveBackupMidnight`（`23:59`）。移除用
